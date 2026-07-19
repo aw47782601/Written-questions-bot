@@ -29,6 +29,16 @@ function isAdmin(chatId) {
   return env.ADMIN_CHAT_IDS.includes(String(chatId));
 }
 
+// Sends a message to every configured admin (best-effort, doesn't throw
+// on individual failures — e.g. an admin who blocked the bot).
+async function notifyAdmins(text, extra = {}) {
+  await Promise.all(
+    env.ADMIN_CHAT_IDS.map((id) =>
+      telegram.sendMessage(id, text, extra).catch((err) => console.error(`notifyAdmins failed for ${id}:`, err.message))
+    )
+  );
+}
+
 function escapeHtml(text) {
   if (!text) return '';
   return String(text)
@@ -71,10 +81,12 @@ async function handleBookUpload(chatId, fileId, fileName) {
   }
 }
 
-// userId (optional): when provided, the user's own validated Gemini keys
-// (if they have MIN_USER_KEYS_FOR_BOOST or more) are pooled in for this
-// request only, giving them extra headroom beyond the shared bot quota.
-async function handleQuestionsBatch(chatId, questions, userId = null) {
+// fromUser (optional): the Telegram `from` object of whoever sent the
+// questions. When provided: (1) their own validated Gemini keys (if they
+// have MIN_USER_KEYS_FOR_BOOST or more) are pooled in for this request
+// only, giving them extra headroom beyond the shared bot quota, and (2)
+// admins get a one-line completion report with the success rate.
+async function handleQuestionsBatch(chatId, questions, fromUser = null) {
   const bookStatus = await getBookStatus();
   if (bookStatus.status !== 'ready') {
     await telegram.sendMessage(
@@ -93,16 +105,31 @@ async function handleQuestionsBatch(chatId, questions, userId = null) {
     await telegram.sendMessage(chatId, `🔎 استلمت ${questions.length} سؤال، جاري البحث في الكتاب...`);
   }
 
+  const userLabel = fromUser
+    ? `${escapeHtml(fromUser.first_name || '')}${fromUser.username ? ' (@' + escapeHtml(fromUser.username) + ')' : ''} — <code>${fromUser.id}</code>`
+    : `<code>${chatId}</code>`;
+
   try {
     let extraKeys = [];
-    if (userId) {
-      const ownKeys = await userApiKeys.getUserApiKeysList(userId);
+    if (fromUser) {
+      const ownKeys = await userApiKeys.getUserApiKeysList(fromUser.id);
       if (ownKeys.length >= MIN_USER_KEYS_FOR_BOOST) {
         extraKeys = ownKeys.map((k) => k.api_key);
       }
     }
     const results = await answerQuestions(questions, extraKeys);
     await telegram.sendLongMessage(chatId, formatResults(results));
+
+    // A question counts as "successfully answered" when Gemini matched
+    // it to real book content (page !== null) and it wasn't a transient
+    // error. Questions the book genuinely doesn't cover come back with
+    // page: null and don't count toward the success rate.
+    const total = results.length;
+    const success = results.filter((r) => !r.isError && r.page !== null).length;
+    await notifyAdmins(
+      `📊 <b>تقرير معالجة أسئلة</b>\n👤 ${userLabel}\n✅ <b>${success}/${total}</b> سؤال اتجاوب عليه من الكتاب.`,
+      { parse_mode: 'HTML' }
+    );
   } catch (err) {
     console.error('Answering failed:', err);
     if (err instanceof DailyLimitReachedError) {
@@ -110,6 +137,10 @@ async function handleQuestionsBatch(chatId, questions, userId = null) {
     } else {
       await telegram.sendMessage(chatId, `❌ حصل خطأ أثناء البحث عن الإجابات:\n${err.message}`);
     }
+    await notifyAdmins(
+      `🛑 <b>فشلت معالجة أسئلة</b>\n👤 ${userLabel}\n📄 عدد الأسئلة: <code>${questions.length}</code>\nالسبب: <code>${escapeHtml(err.message)}</code>`,
+      { parse_mode: 'HTML' }
+    );
   }
 }
 
@@ -213,7 +244,7 @@ async function handleStats(chatId) {
     `👥 <b>المستخدمين:</b>\n` +
     `• الإجمالي: <code>${s.users.total}</code>\n` +
     `• النشطين اليوم: <code>${s.users.active}</code>\n\n` +
-    `💾 <b>الإجابات المحفوظة في الكاش:</b> <code>${s.cachedAnswers}</code>`;
+    `💾 <b>نداءات Gemini اليوم:</b> <code>${s.geminiCallsToday}</code>`;
   await telegram.sendMessage(chatId, report, { parse_mode: 'HTML' });
 }
 
@@ -630,8 +661,15 @@ module.exports = async (req, res) => {
     const chatId = message ? message.chat.id : cb.message.chat.id;
     const admin = isAdmin(chatId);
 
-    // Track the user (for /stats, /user, /broadcast) on every interaction.
-    if (fromUser) await users.upsertUser(fromUser);
+    // Track the user (for /stats, /user, /broadcast) on every interaction,
+    // and notify admins the first time we ever see this user.
+    if (fromUser) {
+      const isNewUser = await users.upsertUserAndCheckNew(fromUser);
+      if (isNewUser && !admin) {
+        const label = `${escapeHtml(fromUser.first_name || '')}${fromUser.username ? ' (@' + escapeHtml(fromUser.username) + ')' : ''} — <code>${fromUser.id}</code>`;
+        await notifyAdmins(`🆕 <b>مستخدم جديد:</b>\n${label}`, { parse_mode: 'HTML' });
+      }
+    }
 
     // 🚫 Ban check — applies to everyone except admins, before anything else.
     if (!admin && fromUser) {
@@ -685,7 +723,7 @@ module.exports = async (req, res) => {
         const questions = isPdf
           ? await extractQuestionsFromPdfBuffer(buffer)
           : await extractQuestionsFromPlainTextBuffer(buffer);
-        await handleQuestionsBatch(chatId, questions, fromUser.id);
+        await handleQuestionsBatch(chatId, questions, fromUser);
       } else {
         await telegram.sendMessage(chatId, '⚠️ الصيغة دي مش مدعومة، ابعت PDF أو TXT.');
       }
@@ -721,7 +759,7 @@ module.exports = async (req, res) => {
         const handledAsKeyPaste = await tryHandleAddKeyPaste(chatId, fromUser.id, text);
         if (!handledAsKeyPaste) {
           const questions = extractQuestionsFromText(text).slice(0, MAX_QUESTIONS);
-          await handleQuestionsBatch(chatId, questions, fromUser.id);
+          await handleQuestionsBatch(chatId, questions, fromUser);
         }
       }
     }
