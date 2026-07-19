@@ -1,0 +1,13 @@
+{
+  "name": "medaad-book-qa-bot",
+  "version": "1.0.0",
+  "description": "Telegram bot: admin uploads curriculum book, students/teachers send up to 100 questions at once, bot answers using RAG over the book via free Gemini API.",
+  "main": "index.js",
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.45.0",
+    "pdf-parse": "^1.1.1"
+  }
+}
