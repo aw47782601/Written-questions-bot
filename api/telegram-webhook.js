@@ -1,6 +1,6 @@
 const env = require('../lib/env');
 const telegram = require('../lib/telegram');
-const { ingestBook, getBookStatus } = require('../lib/ingestBook');
+const { ingestBook, getBookStatus, IngestionInProgressError } = require('../lib/ingestBook');
 const {
   MAX_QUESTIONS,
   extractQuestionsFromPdfBuffer,
@@ -35,6 +35,10 @@ async function handleBookUpload(chatId, fileId, fileName) {
       `✅ تم تجهيز الكتاب بنجاح.\nعدد الصفحات: ${summary.pages}\nعدد الأجزاء القابلة للبحث: ${summary.chunks}\n\nالبوت جاهز يستقبل أسئلة دلوقت.`
     );
   } catch (err) {
+    if (err instanceof IngestionInProgressError) {
+      await telegram.sendMessage(chatId, `⏳ ${err.message}`);
+      return;
+    }
     console.error('Book ingestion failed:', err);
     await telegram.sendMessage(chatId, `❌ فشلت معالجة الكتاب:\n${err.message}`);
   }
