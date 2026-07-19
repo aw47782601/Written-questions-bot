@@ -1,6 +1,7 @@
 const env = require('../lib/env');
 const telegram = require('../lib/telegram');
 const { ingestBook, getBookStatus, IngestionInProgressError } = require('../lib/ingestBook');
+const { keywordSearchChunks, debugRetrieve } = require('../lib/rag');
 const {
   MAX_QUESTIONS,
   extractQuestionsFromPdfBuffer,
@@ -84,8 +85,62 @@ async function handleStatusCommand(chatId) {
     status.total_pages ? `عدد الصفحات: ${status.total_pages}` : null,
     status.total_chunks ? `عدد الأجزاء: ${status.total_chunks}` : null,
     status.error_message ? `آخر خطأ: ${status.error_message}` : null,
+    `موديل الـ embedding الحالي: ${env.GEMINI_EMBEDDING_MODEL}`,
   ].filter(Boolean);
   await telegram.sendMessage(chatId, lines.join('\n'));
+}
+
+// DIAGNOSTIC (admin only): /search <كلمة> — raw text search on book_chunks,
+// bypassing embeddings entirely. Confirms whether content actually made
+// it into the DB, independent of the retrieval/embedding pipeline.
+async function handleSearchCommand(chatId, keyword) {
+  if (!keyword) {
+    await telegram.sendMessage(chatId, 'استخدم: /search كلمة_مفتاحية');
+    return;
+  }
+  try {
+    const rows = await keywordSearchChunks(keyword);
+    if (rows.length === 0) {
+      await telegram.sendMessage(
+        chatId,
+        `⚠️ مفيش أي chunk فيه "${keyword}" حرفيًا في book_chunks.\nمعنى كده إما الكلمة مش موجودة بالظبط بالنص ده، أو المحتوى أصلاً مترفعش صح وقت المعالجة.`
+      );
+      return;
+    }
+    const preview = rows
+      .map((r, i) => `${i + 1}. [صفحة ${r.page_number}] ${r.content.slice(0, 200)}...`)
+      .join('\n\n');
+    await telegram.sendMessage(chatId, `✅ لقيت ${rows.length} chunk فيهم "${keyword}":\n\n${preview}`);
+  } catch (err) {
+    await telegram.sendMessage(chatId, `❌ ${err.message}`);
+  }
+}
+
+// DIAGNOSTIC (admin only): /debug <سؤال> — runs the real embed+retrieve
+// pipeline and shows the matched chunks with similarity scores, without
+// calling the LLM. Low similarity across the board on a known topic
+// points to an embedding-model mismatch between ingestion and now.
+async function handleDebugCommand(chatId, question) {
+  if (!question) {
+    await telegram.sendMessage(chatId, 'استخدم: /debug سؤال تجريبي');
+    return;
+  }
+  try {
+    const chunks = await debugRetrieve(question);
+    if (!chunks || chunks.length === 0) {
+      await telegram.sendMessage(chatId, '⚠️ الـ retrieval رجع صفر chunks خالص.');
+      return;
+    }
+    const preview = chunks
+      .map(
+        (c, i) =>
+          `${i + 1}. [صفحة ${c.page_number}] similarity: ${c.similarity?.toFixed(3) ?? 'N/A'}\n${c.content.slice(0, 150)}...`
+      )
+      .join('\n\n');
+    await telegram.sendMessage(chatId, `نتيجة الـ retrieval لـ "${question}":\n\n${preview}`);
+  } catch (err) {
+    await telegram.sendMessage(chatId, `❌ ${err.message}`);
+  }
 }
 
 module.exports = async (req, res) => {
@@ -128,6 +183,10 @@ module.exports = async (req, res) => {
 
       if (text === '/status' && isAdmin) {
         await handleStatusCommand(chatId);
+      } else if (text.startsWith('/search ') && isAdmin) {
+        await handleSearchCommand(chatId, text.slice('/search '.length).trim());
+      } else if (text.startsWith('/debug ') && isAdmin) {
+        await handleDebugCommand(chatId, text.slice('/debug '.length).trim());
       } else if (text.startsWith('/')) {
         await telegram.sendMessage(chatId, 'ابعتلي سؤال أو أكتر (سؤال في كل سطر) وهدور عليهم في الكتاب.');
       } else {
