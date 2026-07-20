@@ -15,6 +15,7 @@ const botConfig = require('../lib/botConfig');
 const users = require('../lib/users');
 const userApiKeys = require('../lib/userApiKeys');
 const telegramUpdates = require('../lib/telegramUpdates');
+const cairoTime = require('../lib/cairoTime');
 
 // Hobby plan's default/max duration is 300s (5 min) with fluid compute
 // enabled (default on new projects) — see vercel.json.
@@ -547,6 +548,10 @@ async function handleAdminHelp(chatId) {
     `• <code>/repairoff</code> — إيقاف الصيانة.\n\n` +
     `🚫 <b>حظر المستخدمين:</b>\n` +
     `• <code>/ban USER_ID</code>, <code>/unban USER_ID</code>, <code>/banlist</code>\n\n` +
+    `⏳ <b>فترات إغلاق مجدولة (زي الامتحانات):</b>\n` +
+    `• <code>/addblock 2026-06-01 08:00 | 2026-06-15 20:00 | امتحانات نصف العام</code> — يقفل البوت لكل حد غير الأدمن في الفترة دي (بتوقيت القاهرة، السبب اختياري).\n` +
+    `• <code>/blocklist</code> — عرض كل الفترات المجدولة وحالتها (شغالة/لسه/انتهت).\n` +
+    `• <code>/removeblock ID</code> — حذف فترة (الرقم من /blocklist).\n\n` +
     `🔑 <b>مفاتيح API الخاصة بالمستخدمين:</b>\n` +
     `• <code>/mykeys</code>, <code>/addkey</code>, <code>/removekey</code> — تعمل للأدمن أيضاً على مفاتيحه.\n` +
     ` مفتاحين أو أكتر يمنحوا المستخدم أولوية إضافية في حصة Gemini اليومية.`;
@@ -724,6 +729,93 @@ async function handleBanList(chatId) {
   }
   const list = banned.map((id, i) => `${i + 1}. <code>${id}</code>`).join('\n');
   await telegram.sendMessage(chatId, `🚫 <b>المستخدمون المحظورون (${banned.length}):</b>\n\n${list}`, { parse_mode: 'HTML' });
+}
+
+// =========================================================
+// ⏳ Scheduled block periods (e.g. exam times)
+// =========================================================
+// Lets an admin schedule one or more time windows (Cairo local time) during
+// which the bot stops responding to anyone except admins — same effect as
+// maintenance mode, but on a schedule instead of a manual on/off switch.
+// Multiple periods can be active/queued at once (e.g. one per exam).
+
+function describeBlockedPeriod(p, nowMs) {
+  const startMs = Date.parse(p.startAt);
+  const endMs = Date.parse(p.endAt);
+  const status = nowMs >= startMs && nowMs < endMs ? '🔴 شغالة دلوقتي' : nowMs >= endMs ? '⚪ انتهت' : '🟡 لسه ما بدأتش';
+  const label = p.label ? `\nالسبب: ${escapeHtml(p.label)}` : '';
+  return (
+    `#${p.id} — ${status}\n` +
+    `من ${cairoTime.formatUtcIsoAsCairo(p.startAt)} لحد ${cairoTime.formatUtcIsoAsCairo(p.endAt)} (بتوقيت القاهرة)` +
+    label
+  );
+}
+
+async function handleAddBlock(chatId, argsText) {
+  const parts = argsText.split('|').map((p) => p.trim());
+  if (parts.length < 2 || !parts[0] || !parts[1]) {
+    await telegram.sendMessage(
+      chatId,
+      '⚠️ الصيغة غلط. استخدم:\n<code>/addblock 2026-06-01 08:00 | 2026-06-15 20:00 | امتحانات نصف العام</code>\n\n' +
+        'الليبل (السبب) اختياري. الوقت المتوقع هو <b>توقيت القاهرة المحلي</b> بصيغة <code>yyyy-MM-dd HH:mm</code>.',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+
+  const [startRaw, endRaw, label] = parts;
+  const startAt = cairoTime.parseCairoLocalToUtcIso(startRaw);
+  const endAt = cairoTime.parseCairoLocalToUtcIso(endRaw);
+
+  if (!startAt || !endAt) {
+    await telegram.sendMessage(
+      chatId,
+      '⚠️ التاريخ/الوقت مش بالصيغة الصح. لازم يكون بالشكل ده: <code>2026-06-01 08:00</code> (بتوقيت القاهرة).',
+      { parse_mode: 'HTML' }
+    );
+    return;
+  }
+  if (Date.parse(endAt) <= Date.parse(startAt)) {
+    await telegram.sendMessage(chatId, '⚠️ وقت النهاية لازم يكون بعد وقت البداية.');
+    return;
+  }
+
+  const id = await botConfig.addBlockedPeriod(startAt, endAt, label || null);
+  const labelLine = label ? `\nالسبب: ${escapeHtml(label)}` : '';
+  await telegram.sendMessage(
+    chatId,
+    `✅ اتضافت فترة إغلاق رقم <code>#${id}</code>:\n` +
+      `من ${cairoTime.formatUtcIsoAsCairo(startAt)} لحد ${cairoTime.formatUtcIsoAsCairo(endAt)} (بتوقيت القاهرة)${labelLine}\n\n` +
+      `في الفترة دي، البوت هيقف عن الرد لأي حد غير الأدمن.`,
+    { parse_mode: 'HTML' }
+  );
+}
+
+async function handleBlockList(chatId) {
+  const periods = await botConfig.getBlockedPeriods();
+  if (periods.length === 0) {
+    await telegram.sendMessage(chatId, '📭 مفيش أي فترات إغلاق مجدولة حالياً.');
+    return;
+  }
+  const nowMs = Date.now();
+  const lines = [...periods]
+    .sort((a, b) => Date.parse(a.startAt) - Date.parse(b.startAt))
+    .map((p) => describeBlockedPeriod(p, nowMs));
+  await telegram.sendMessage(chatId, `⏳ <b>فترات الإغلاق المجدولة (${periods.length}):</b>\n\n${lines.join('\n\n')}`, {
+    parse_mode: 'HTML',
+  });
+}
+
+async function handleRemoveBlock(chatId, idText) {
+  const id = parseInt(idText, 10);
+  if (Number.isNaN(id)) {
+    await telegram.sendMessage(chatId, '⚠️ استخدم: <code>/removeblock ID</code> (شوف الأرقام عبر /blocklist).', {
+      parse_mode: 'HTML',
+    });
+    return;
+  }
+  const removed = await botConfig.removeBlockedPeriod(id);
+  await telegram.sendMessage(chatId, removed ? `✅ اتشالت فترة الإغلاق #${id}.` : `⚠️ مفيش فترة إغلاق بالرقم #${id}.`);
 }
 
 // =========================================================
@@ -1013,6 +1105,18 @@ async function tryHandleAdminCommand(chatId, adminId, text) {
     await handleBanList(chatId);
     return true;
   }
+  if (text.startsWith('/addblock ')) {
+    await handleAddBlock(chatId, text.replace('/addblock ', '').trim());
+    return true;
+  }
+  if (text === '/blocklist') {
+    await handleBlockList(chatId);
+    return true;
+  }
+  if (text.startsWith('/removeblock ')) {
+    await handleRemoveBlock(chatId, text.replace('/removeblock ', '').trim());
+    return true;
+  }
   return false;
 }
 
@@ -1087,6 +1191,23 @@ module.exports = async (req, res) => {
       if (maintenanceOn) {
         if (message) await telegram.sendMessage(chatId, '⚠️ عذراً، البوت في وضع الصيانة حالياً. سنعود للعمل قريباً.');
         else await telegram.answerCallbackQuery(cb.id, { text: '⚠️ الصيانة مفعلة.', show_alert: true });
+        res.status(200).json({ ok: true });
+        return;
+      }
+    }
+
+    // ⏳ Scheduled block periods (e.g. exam times) — applies to everyone
+    // except admins. Checked against real wall-clock Cairo time, so it
+    // stays correct whether the current date falls in DST (summer, UTC+3)
+    // or standard time (winter, UTC+2) — see lib/cairoTime.js.
+    if (!admin) {
+      const activePeriod = await botConfig.getActiveBlockedPeriod();
+      if (activePeriod) {
+        const label = activePeriod.label ? ` (${activePeriod.label})` : '';
+        const untilText = cairoTime.formatUtcIsoAsCairo(activePeriod.endAt);
+        const blockedMsg = `⏳ البوت متوقف مؤقتاً حالياً${label}.\nهيرجع يشتغل تاني الساعة ${untilText} (بتوقيت القاهرة).`;
+        if (message) await telegram.sendMessage(chatId, blockedMsg);
+        else await telegram.answerCallbackQuery(cb.id, { text: '⏳ البوت متوقف مؤقتاً حالياً.', show_alert: true });
         res.status(200).json({ ok: true });
         return;
       }
