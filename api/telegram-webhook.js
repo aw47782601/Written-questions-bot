@@ -164,7 +164,13 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
         extraKeys = ownKeys.map((k) => k.api_key);
       }
     }
-    const results = await answerQuestions(questions, book.id, extraKeys);
+    const results = await answerQuestions(questions, book.id, extraKeys, async (question, errMessage) => {
+      const trimmed = errMessage.length > 1500 ? `${errMessage.slice(0, 1500)}…` : errMessage;
+      await notifyAdmins(
+        `🟠 <b>فشل سؤال بعد كل المحاولات</b>\n👤 ${userLabel}\n❓ ${escapeHtml(question)}\nالسبب الحقيقي: <code>${escapeHtml(trimmed)}</code>`,
+        { parse_mode: 'HTML' }
+      );
+    });
     await telegram.sendLongMessage(chatId, formatResults(results));
 
     // A question counts as "successfully answered" when Gemini matched
