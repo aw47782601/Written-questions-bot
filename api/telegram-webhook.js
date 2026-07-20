@@ -1,6 +1,6 @@
 const env = require('../lib/env');
 const telegram = require('../lib/telegram');
-const { ingestBook, getBookStatus, IngestionInProgressError } = require('../lib/ingestBook');
+const books = require('../lib/books');
 const { keywordSearchChunks, debugRetrieve } = require('../lib/rag');
 const {
   MAX_QUESTIONS,
@@ -13,6 +13,7 @@ const { DailyLimitReachedError } = require('../lib/usageTracker');
 const botConfig = require('../lib/botConfig');
 const users = require('../lib/users');
 const userApiKeys = require('../lib/userApiKeys');
+const telegramUpdates = require('../lib/telegramUpdates');
 
 // Hobby plan's default/max duration is 300s (5 min) with fluid compute
 // enabled (default on new projects) — see vercel.json.
@@ -60,25 +61,59 @@ function formatResults(results) {
     .join('\n\n');
 }
 
-async function handleBookUpload(chatId, fileId, fileName) {
-  await telegram.sendMessage(chatId, '📚 استلمت الكتاب، جاري المعالجة...');
+function bookNameFromFileName(fileName) {
+  return fileName.replace(/\.pdf$/i, '').replace(/[_-]+/g, ' ').trim() || 'كتاب بدون اسم';
+}
+
+// Admin PDF upload = add a new book (existing books are untouched — many
+// books can coexist, each user picks one via /mybook). The book's name
+// comes from, in order of priority: (1) a name staged via /addbook <name>
+// right before the upload, (2) the document's caption, (3) the filename.
+async function handleBookUpload(chatId, adminId, fileId, fileName, caption) {
+  const pending = await botConfig.getConfig(`addbookbuf_${adminId}`);
+  if (pending?.name) await botConfig.deleteConfig(`addbookbuf_${adminId}`);
+  const bookName = pending?.name || (caption && caption.trim()) || bookNameFromFileName(fileName);
+
+  await telegram.sendMessage(chatId, `📚 استلمت الكتاب "${bookName}"، جاري المعالجة...`);
   try {
     const buffer = await telegram.downloadFileBuffer(fileId);
-    const summary = await ingestBook(buffer, fileName, (msg) =>
+    const summary = await books.ingestNewBook(buffer, fileName, bookName, (msg) =>
       telegram.sendMessage(chatId, msg)
     );
     await telegram.sendMessage(
       chatId,
-      `✅ تم تجهيز الكتاب بنجاح.\nعدد الصفحات: ${summary.pages}\nعدد الأجزاء القابلة للبحث: ${summary.chunks}\n\nالبوت جاهز يستقبل أسئلة دلوقت.`
+      `✅ تم تجهيز الكتاب "${bookName}" بنجاح (ID: ${summary.id}).\n` +
+        `عدد الصفحات: ${summary.pages}\nعدد الأجزاء القابلة للبحث: ${summary.chunks}\n\n` +
+        `المستخدمين هيقدروا يختاروه عبر /mybook.`
     );
   } catch (err) {
-    if (err instanceof IngestionInProgressError) {
-      await telegram.sendMessage(chatId, `⏳ ${err.message}`);
-      return;
-    }
     console.error('Book ingestion failed:', err);
-    await telegram.sendMessage(chatId, `❌ فشلت معالجة الكتاب:\n${err.message}`);
+    await telegram.sendMessage(chatId, `❌ فشلت معالجة الكتاب "${bookName}":\n${err.message}`);
   }
+}
+
+// Resolves which book to answer against for this user. Auto-selects and
+// persists when there's exactly one ready book (so solo-book deployments
+// need zero extra steps from users). When there are 0 or 2+ ready books,
+// returns null and the caller tells the user what to do.
+async function resolveBookForUser(fromUser) {
+  const readyBooks = await books.listReadyBooks();
+  if (readyBooks.length === 0) return { readyBooks, book: null };
+
+  const selectedId = fromUser ? await users.getSelectedBookId(fromUser.id) : null;
+  if (selectedId) {
+    const stillReady = readyBooks.find((b) => b.id === selectedId);
+    if (stillReady) return { readyBooks, book: stillReady };
+    // Previously-selected book was deleted or is no longer ready — fall
+    // through to re-resolve below.
+  }
+
+  if (readyBooks.length === 1) {
+    if (fromUser) await users.setSelectedBookId(fromUser.id, readyBooks[0].id);
+    return { readyBooks, book: readyBooks[0] };
+  }
+
+  return { readyBooks, book: null };
 }
 
 // fromUser (optional): the Telegram `from` object of whoever sent the
@@ -87,11 +122,20 @@ async function handleBookUpload(chatId, fileId, fileName) {
 // only, giving them extra headroom beyond the shared bot quota, and (2)
 // admins get a one-line completion report with the success rate.
 async function handleQuestionsBatch(chatId, questions, fromUser = null) {
-  const bookStatus = await getBookStatus();
-  if (bookStatus.status !== 'ready') {
+  const { readyBooks, book } = await resolveBookForUser(fromUser);
+
+  if (readyBooks.length === 0) {
     await telegram.sendMessage(
       chatId,
-      '⚠️ لسه مفيش كتاب جاهز للبحث فيه. لازم الأدمن يرفع الكتاب الأول.'
+      '⚠️ لسه مفيش أي كتاب جاهز للبحث فيه. لازم الأدمن يرفع كتاب الأول.'
+    );
+    return;
+  }
+
+  if (!book) {
+    await telegram.sendMessage(
+      chatId,
+      `📚 فيه أكتر من كتاب متاح (${readyBooks.length}). اختار الكتاب اللي عايز تدور فيه الأول عبر /mybook.`
     );
     return;
   }
@@ -102,7 +146,10 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
   }
 
   if (questions.length > 1) {
-    await telegram.sendMessage(chatId, `🔎 استلمت ${questions.length} سؤال، جاري البحث في الكتاب...`);
+    await telegram.sendMessage(
+      chatId,
+      `🔎 استلمت ${questions.length} سؤال، جاري البحث في "${book.name}"...`
+    );
   }
 
   const userLabel = fromUser
@@ -117,7 +164,7 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
         extraKeys = ownKeys.map((k) => k.api_key);
       }
     }
-    const results = await answerQuestions(questions, extraKeys);
+    const results = await answerQuestions(questions, book.id, extraKeys);
     await telegram.sendLongMessage(chatId, formatResults(results));
 
     // A question counts as "successfully answered" when Gemini matched
@@ -127,7 +174,7 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
     const total = results.length;
     const success = results.filter((r) => !r.isError && r.page !== null).length;
     await notifyAdmins(
-      `📊 <b>تقرير معالجة أسئلة</b>\n👤 ${userLabel}\n✅ <b>${success}/${total}</b> سؤال اتجاوب عليه من الكتاب.`,
+      `📊 <b>تقرير معالجة أسئلة</b>\n👤 ${userLabel}\n📖 ${escapeHtml(book.name)}\n✅ <b>${success}/${total}</b> سؤال اتجاوب عليه من الكتاب.`,
       { parse_mode: 'HTML' }
     );
   } catch (err) {
@@ -145,16 +192,85 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
 }
 
 async function handleStatusCommand(chatId) {
-  const status = await getBookStatus();
-  const lines = [
-    `الحالة: ${status.status}`,
-    status.file_name ? `الملف: ${status.file_name}` : null,
-    status.total_pages ? `عدد الصفحات: ${status.total_pages}` : null,
-    status.total_chunks ? `عدد الأجزاء: ${status.total_chunks}` : null,
-    status.error_message ? `آخر خطأ: ${status.error_message}` : null,
-    `موديل الـ embedding الحالي: ${env.GEMINI_EMBEDDING_MODEL}`,
-  ].filter(Boolean);
-  await telegram.sendMessage(chatId, lines.join('\n'));
+  const allBooks = await books.listBooks();
+  if (allBooks.length === 0) {
+    await telegram.sendMessage(chatId, 'لسه مفيش أي كتاب مضاف. استخدم /addbook ثم ابعت PDF.');
+    return;
+  }
+  const lines = allBooks.map((b) => {
+    const parts = [
+      `📖 <b>${escapeHtml(b.name)}</b> (ID: <code>${b.id}</code>)`,
+      `الحالة: ${b.status}`,
+      b.file_name ? `الملف: ${escapeHtml(b.file_name)}` : null,
+      b.total_pages ? `عدد الصفحات: ${b.total_pages}` : null,
+      b.total_chunks ? `عدد الأجزاء: ${b.total_chunks}` : null,
+      b.error_message ? `آخر خطأ: ${escapeHtml(b.error_message)}` : null,
+    ].filter(Boolean);
+    return parts.join('\n');
+  });
+  lines.push(`موديل الـ embedding الحالي: ${env.GEMINI_EMBEDDING_MODEL}`);
+  await telegram.sendMessage(chatId, lines.join('\n\n'), { parse_mode: 'HTML' });
+}
+
+async function handleBooksList(chatId) {
+  return handleStatusCommand(chatId);
+}
+
+async function handleAddBookStart(chatId, adminId, name) {
+  if (!name) {
+    await telegram.sendMessage(chatId, '⚠️ استخدم: <code>/addbook اسم الكتاب</code>، وبعدين ابعت ملف الـ PDF.', {
+      parse_mode: 'HTML',
+    });
+    return;
+  }
+  await botConfig.setConfig(`addbookbuf_${adminId}`, { name });
+  await telegram.sendMessage(
+    chatId,
+    `✅ تمام، دلوقت ابعت ملف الـ PDF الخاص بكتاب "${name}".`
+  );
+}
+
+async function handleDeleteBook(chatId, bookIdRaw) {
+  const bookId = Number(bookIdRaw);
+  if (!bookIdRaw || Number.isNaN(bookId)) {
+    await telegram.sendMessage(chatId, '⚠️ استخدم: <code>/deletebook ID</code> — استخدم /books عشان تعرف الـ IDs.', {
+      parse_mode: 'HTML',
+    });
+    return;
+  }
+  const book = await books.getBook(bookId);
+  if (!book) {
+    await telegram.sendMessage(chatId, `❌ مفيش كتاب بـ ID: ${bookId}.`);
+    return;
+  }
+  await books.deleteBook(bookId);
+  await telegram.sendMessage(chatId, `✅ تم حذف الكتاب "${escapeHtml(book.name)}" (ID: ${bookId}).`, {
+    parse_mode: 'HTML',
+  });
+}
+
+// =========================================================
+// 📖 /mybook — every user (not just admins) picks which book their
+// questions get answered against, and can change it any time.
+// =========================================================
+
+async function handleMyBookCommand(chatId, userId) {
+  const readyBooks = await books.listReadyBooks();
+  if (readyBooks.length === 0) {
+    await telegram.sendMessage(chatId, '⚠️ لسه مفيش أي كتاب جاهز. لازم الأدمن يرفع كتاب الأول.');
+    return;
+  }
+
+  const selectedId = await users.getSelectedBookId(userId);
+  const buttons = readyBooks.map((b) => [
+    {
+      text: `${b.id === selectedId ? '✅ ' : ''}${b.name}`,
+      callback_data: `cmd_selectbook_${b.id}`,
+    },
+  ]);
+  await telegram.sendMessage(chatId, '📚 اختار الكتاب اللي عايز تدور فيه:', {
+    reply_markup: { inline_keyboard: buttons },
+  });
 }
 
 // DIAGNOSTIC (admin only): /search <كلمة> — raw text search on book_chunks,
@@ -220,6 +336,12 @@ async function handleAdminHelp(chatId) {
     `📊 <b>الإحصائيات:</b>\n` +
     `• <code>/stats</code> — إحصائيات عامة (مستخدمين، إجابات محفوظة).\n` +
     `• <code>/user USER_ID</code> — تقرير عن مستخدم معين.\n\n` +
+    `📚 <b>إدارة الكتب:</b>\n` +
+    `• <code>/addbook اسم الكتاب</code> ثم ابعت ملف PDF — إضافة كتاب جديد (من غير ما يمسح أي كتاب موجود).\n` +
+    `• ابعت PDF بدون /addbook — هياخد اسمه من الـ caption لو موجود، أو من اسم الملف.\n` +
+    `• <code>/books</code> أو <code>/status</code> — عرض كل الكتب وحالتها.\n` +
+    `• <code>/deletebook ID</code> — حذف كتاب.\n` +
+    `• <code>/search كلمة</code> و <code>/debug سؤال</code> — أدوات تشخيصية على كل الكتب.\n\n` +
     `⚙️ <b>الإعدادات العامة:</b>\n` +
     `• <code>/setwelcome النص</code> — تغيير رسالة الترحيب عند /start.\n` +
     `• <code>/setalert النص</code> — تنبيه عام يظهر لكل مستخدم مرة واحدة.\n\n` +
@@ -552,6 +674,19 @@ async function handleCallbackQuery(cb) {
     return;
   }
 
+  if (data.startsWith('cmd_selectbook_')) {
+    const bookId = Number(data.replace('cmd_selectbook_', ''));
+    const book = await books.getBook(bookId);
+    if (!book || book.status !== 'ready') {
+      await telegram.answerCallbackQuery(cb.id, { text: '❌ الكتاب ده مش متاح دلوقت.', show_alert: true });
+      return;
+    }
+    await users.setSelectedBookId(userId, bookId);
+    await telegram.answerCallbackQuery(cb.id, { text: `✅ تم اختيار "${book.name}".` });
+    await telegram.editMessageText(chatId, messageId, `📖 هتدور دلوقت في: *${book.name}*\n\nممكن تغيّره في أي وقت عبر /mybook.`);
+    return;
+  }
+
   if (data === 'cmd_broadcast_confirm') {
     if (!isAdmin(userId)) {
       await telegram.answerCallbackQuery(cb.id);
@@ -602,6 +737,18 @@ async function tryHandleAdminCommand(chatId, adminId, text) {
     await handleUserReport(chatId, text.split(' ')[1]);
     return true;
   }
+  if (text === '/books') {
+    await handleBooksList(chatId);
+    return true;
+  }
+  if (text.startsWith('/addbook ')) {
+    await handleAddBookStart(chatId, adminId, text.replace('/addbook ', '').trim());
+    return true;
+  }
+  if (text.startsWith('/deletebook ')) {
+    await handleDeleteBook(chatId, text.replace('/deletebook ', '').trim());
+    return true;
+  }
   if (text.startsWith('/setwelcome ')) {
     await handleSetWelcome(chatId, text.replace('/setwelcome ', '').trim());
     return true;
@@ -649,6 +796,24 @@ module.exports = async (req, res) => {
 
   try {
     const update = req.body;
+
+    // 🔁 Dedup: Telegram resends an update if it doesn't get a fast
+    // response. Answering a big batch of questions can take a while, so
+    // without this, a resend would kick off a second parallel search for
+    // the same request. update_id is unique per update from Telegram, so
+    // an atomic insert into telegram_updates tells us definitively
+    // whether we've already started handling this one.
+    if (await telegramUpdates.isDuplicateUpdate(update.update_id)) {
+      res.status(200).json({ ok: true });
+      return;
+    }
+    // Occasional best-effort cleanup of old dedup rows (not required for
+    // correctness — just keeps the table small). Fire-and-forget, low
+    // probability so it doesn't add latency to most requests.
+    if (Math.random() < 0.01) {
+      telegramUpdates.pruneOldUpdates().catch(() => {});
+    }
+
     const message = update.message;
     const cb = update.callback_query;
 
@@ -715,8 +880,8 @@ module.exports = async (req, res) => {
       const isText = fileName.toLowerCase().endsWith('.txt');
 
       if (admin && isPdf) {
-        // Admin sending a PDF = replace the active curriculum book.
-        await handleBookUpload(chatId, message.document.file_id, fileName);
+        // Admin sending a PDF = add a new book (existing books untouched).
+        await handleBookUpload(chatId, chatId, message.document.file_id, fileName, message.caption);
       } else if (isPdf || isText) {
         // Anyone else sending a document = a batch of questions.
         const buffer = await telegram.downloadFileBuffer(message.document.file_id);
@@ -736,15 +901,18 @@ module.exports = async (req, res) => {
           welcomeCfg?.text ||
           `مرحباً بك ${fromUser.first_name}! 👋\n\n` +
             `ابعتلي سؤال أو أكتر (سؤال في كل سطر)، أو ملف PDF/TXT فيه أسئلة، وهدور عليهم في الكتاب.\n\n` +
+            `📚 لو فيه أكتر من كتاب متاح، اختار اللي عايزه عبر /mybook.\n\n` +
             `🔑 عايز أولوية إضافية في حصة الاستخدام اليومية؟ أضف مفتاح Gemini API الخاص بك (مجاني) عبر /addkey.`;
         await telegram.sendMessage(chatId, welcomeText);
         await users.checkAndSendAlert(chatId, fromUser, telegram.sendMessage);
-      } else if (text === '/status' && admin) {
+      } else if ((text === '/status' || text === '/books') && admin) {
         await handleStatusCommand(chatId);
       } else if (text.startsWith('/search ') && admin) {
         await handleSearchCommand(chatId, text.slice('/search '.length).trim());
       } else if (text.startsWith('/debug ') && admin) {
         await handleDebugCommand(chatId, text.slice('/debug '.length).trim());
+      } else if (text.startsWith('/mybook')) {
+        await handleMyBookCommand(chatId, fromUser.id);
       } else if (text.startsWith('/addkey')) {
         await handleAddKeyStart(chatId, fromUser.id);
       } else if (text.startsWith('/mykeys')) {
