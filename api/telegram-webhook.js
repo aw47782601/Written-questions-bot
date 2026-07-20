@@ -549,9 +549,11 @@ async function handleAdminHelp(chatId) {
     `🚫 <b>حظر المستخدمين:</b>\n` +
     `• <code>/ban USER_ID</code>, <code>/unban USER_ID</code>, <code>/banlist</code>\n\n` +
     `⏳ <b>فترات إغلاق مجدولة (زي الامتحانات):</b>\n` +
-    `• <code>/addblock 2026-06-01 08:00 | 2026-06-15 20:00 | امتحانات نصف العام</code> — يقفل البوت لكل حد غير الأدمن في الفترة دي (بتوقيت القاهرة، السبب اختياري).\n` +
+    `• <code>/addblock</code> — يفتح لك تقويم وأزرار لاختيار تاريخ ووقت البداية والنهاية (12 ساعة + صباحاً/مساءً)، من غير ما تكتب حاجة يدوي. يقفل البوت لكل حد غير الأدمن في الفترة دي (بتوقيت القاهرة).\n` +
+    `• <code>/addblock 2026-06-01 08:00 AM | 2026-06-15 08:00 PM | امتحانات نصف العام</code> — طريقة الكتابة اليدوية القديمة لسه شغالة لو حبيت (بتقبل صباحاً/مساءً أو نظام الـ24 ساعة، السبب اختياري).\n` +
     `• <code>/blocklist</code> — عرض كل الفترات المجدولة وحالتها (شغالة/لسه/انتهت).\n` +
-    `• <code>/removeblock ID</code> — حذف فترة (الرقم من /blocklist).\n\n` +
+    `• <code>/removeblock</code> — يديك قايمة أزرار لكل فترة مع 🗑 تحذفها منها مباشرة.\n` +
+    `• <code>/removeblock ID</code> — حذف فترة بكتابة رقمها يدوي (الرقم من /blocklist)، لسه شغالة لو حبيت.\n\n` +
     `🔑 <b>مفاتيح API الخاصة بالمستخدمين:</b>\n` +
     `• <code>/mykeys</code>, <code>/addkey</code>, <code>/removekey</code> — تعمل للأدمن أيضاً على مفاتيحه.\n` +
     ` مفتاحين أو أكتر يمنحوا المستخدم أولوية إضافية في حصة Gemini اليومية.`;
@@ -756,8 +758,9 @@ async function handleAddBlock(chatId, argsText) {
   if (parts.length < 2 || !parts[0] || !parts[1]) {
     await telegram.sendMessage(
       chatId,
-      '⚠️ الصيغة غلط. استخدم:\n<code>/addblock 2026-06-01 08:00 | 2026-06-15 20:00 | امتحانات نصف العام</code>\n\n' +
-        'الليبل (السبب) اختياري. الوقت المتوقع هو <b>توقيت القاهرة المحلي</b> بصيغة <code>yyyy-MM-dd HH:mm</code>.',
+      '⚠️ الصيغة غلط. استخدم:\n<code>/addblock 2026-06-01 08:00 AM | 2026-06-15 08:00 PM | امتحانات نصف العام</code>\n\n' +
+        'الليبل (السبب) اختياري. الوقت المتوقع هو <b>توقيت القاهرة المحلي</b>، وممكن تكتبه بصيغة 12 ساعة زي <code>08:00 AM</code>/<code>08:00 PM</code> أو 24 ساعة زي <code>20:00</code>.\n\n' +
+        'أو ببساطة ابعت <code>/addblock</code> من غير أي حاجة تانية وهيديك تقويم وأزرار تختار منها.',
       { parse_mode: 'HTML' }
     );
     return;
@@ -770,7 +773,7 @@ async function handleAddBlock(chatId, argsText) {
   if (!startAt || !endAt) {
     await telegram.sendMessage(
       chatId,
-      '⚠️ التاريخ/الوقت مش بالصيغة الصح. لازم يكون بالشكل ده: <code>2026-06-01 08:00</code> (بتوقيت القاهرة).',
+      '⚠️ التاريخ/الوقت مش بالصيغة الصح. لازم يكون بالشكل ده: <code>2026-06-01 08:00 AM</code> أو <code>2026-06-01 20:00</code> (بتوقيت القاهرة).',
       { parse_mode: 'HTML' }
     );
     return;
@@ -816,6 +819,314 @@ async function handleRemoveBlock(chatId, idText) {
   }
   const removed = await botConfig.removeBlockedPeriod(id);
   await telegram.sendMessage(chatId, removed ? `✅ اتشالت فترة الإغلاق #${id}.` : `⚠️ مفيش فترة إغلاق بالرقم #${id}.`);
+}
+
+// Button-based alternative to typing /removeblock ID: lists every
+// scheduled period with its status and a 🗑 button to delete it directly.
+async function handleRemoveBlockPrompt(chatId) {
+  const periods = await botConfig.getBlockedPeriods();
+  if (periods.length === 0) {
+    await telegram.sendMessage(chatId, '📭 مفيش أي فترات إغلاق مجدولة حالياً.');
+    return;
+  }
+  const nowMs = Date.now();
+  const sorted = [...periods].sort((a, b) => Date.parse(a.startAt) - Date.parse(b.startAt));
+  const buttons = sorted.map((p) => {
+    const startMs = Date.parse(p.startAt);
+    const endMs = Date.parse(p.endAt);
+    const status = nowMs >= startMs && nowMs < endMs ? '🔴' : nowMs >= endMs ? '⚪' : '🟡';
+    const labelPart = p.label ? ` — ${p.label}` : '';
+    const text = `🗑 #${p.id} ${status} ${cairoTime.formatUtcIsoAsCairo(p.startAt)}${labelPart}`;
+    return [{ text: text.length > 64 ? `${text.slice(0, 61)}...` : text, callback_data: `blk_remove_${p.id}` }];
+  });
+  buttons.push([{ text: '❌ إلغاء', callback_data: 'blk_removeblock_cancel' }]);
+  await telegram.sendMessage(chatId, '🗑 اختر فترة الإغلاق اللي عايز تشيلها:', {
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
+async function handleRemoveBlockConfirmed(chatId, messageId, id) {
+  const removed = await botConfig.removeBlockedPeriod(id);
+  await telegram.editMessageText(
+    chatId,
+    messageId,
+    removed ? `✅ اتشالت فترة الإغلاق #${id}.` : `⚠️ مفيش فترة إغلاق بالرقم #${id}.`
+  );
+}
+
+// =========================================================
+// 📅 /addblock button-based picker
+// =========================================================
+// Walks the admin through picking start/end dates from an inline-keyboard
+// calendar and a 12-hour AM/PM time picker, instead of typing the whole
+// "/addblock yyyy-MM-dd HH:mm | ..." command by hand. State for the
+// in-progress wizard is kept in bot_config per admin (same pattern as the
+// /addkey paste buffer), so it survives across the separate webhook
+// invocations that handle each button tap.
+
+function addBlockStateKey(adminId) {
+  return `addblockbuf_${adminId}`;
+}
+
+function buildCalendarButtons(side, year, month) {
+  const daysInMonth = cairoTime.daysInCairoMonth(year, month);
+  const startIdx = cairoTime.firstWeekdaySunIndex(year, month);
+  const dayNames = ['ح', 'ن', 'ث', 'ر', 'خ', 'ج', 'س'];
+  const rows = [dayNames.map((d) => ({ text: d, callback_data: 'blk_noop' }))];
+
+  let row = [];
+  for (let i = 0; i < startIdx; i++) row.push({ text: ' ', callback_data: 'blk_noop' });
+  for (let day = 1; day <= daysInMonth; day++) {
+    const ds = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+    row.push({ text: String(day), callback_data: `blk_date_${side}_${ds}` });
+    if (row.length === 7) {
+      rows.push(row);
+      row = [];
+    }
+  }
+  if (row.length > 0) {
+    while (row.length < 7) row.push({ text: ' ', callback_data: 'blk_noop' });
+    rows.push(row);
+  }
+
+  const prev = month === 1 ? { y: year - 1, m: 12 } : { y: year, m: month - 1 };
+  const next = month === 12 ? { y: year + 1, m: 1 } : { y: year, m: month + 1 };
+  rows.push([
+    { text: '« السابق', callback_data: `blk_navcal_${side}_${prev.y}-${prev.m}` },
+    { text: `${cairoTime.arabicMonthName(month)} ${year}`, callback_data: 'blk_noop' },
+    { text: 'التالي »', callback_data: `blk_navcal_${side}_${next.y}-${next.m}` },
+  ]);
+  rows.push([{ text: '❌ إلغاء', callback_data: 'blk_cancel' }]);
+  return rows;
+}
+
+function buildHourButtons(side) {
+  const rows = [];
+  for (let r = 0; r < 3; r++) {
+    const row = [];
+    for (let c = 1; c <= 4; c++) {
+      const h = r * 4 + c;
+      row.push({ text: String(h), callback_data: `blk_hour_${side}_${h}` });
+    }
+    rows.push(row);
+  }
+  rows.push([{ text: '❌ إلغاء', callback_data: 'blk_cancel' }]);
+  return rows;
+}
+
+function buildMinuteButtons(side) {
+  const minutes = ['00', '15', '30', '45'];
+  return [
+    minutes.map((m) => ({ text: `:${m}`, callback_data: `blk_min_${side}_${m}` })),
+    [{ text: '❌ إلغاء', callback_data: 'blk_cancel' }],
+  ];
+}
+
+function buildAmPmButtons(side) {
+  return [
+    [
+      { text: '🌅 صباحاً AM', callback_data: `blk_ampm_${side}_AM` },
+      { text: '🌙 مساءً PM', callback_data: `blk_ampm_${side}_PM` },
+    ],
+    [{ text: '❌ إلغاء', callback_data: 'blk_cancel' }],
+  ];
+}
+
+async function handleAddBlockStart(chatId, adminId) {
+  const { year, month } = cairoTime.nowCairoYearMonth();
+  const state = { stage: 'start_date', calYear: year, calMonth: month };
+  await botConfig.setConfig(addBlockStateKey(adminId), state);
+  await telegram.sendMessage(
+    chatId,
+    `⏳ <b>إضافة فترة إغلاق مجدولة</b>\n\nاختار تاريخ <b>بداية</b> الفترة (بتوقيت القاهرة):`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: buildCalendarButtons('start', year, month) } }
+  );
+}
+
+async function handleAddBlockCalendarNav(chatId, messageId, adminId, side, year, month) {
+  const state = await botConfig.getConfig(addBlockStateKey(adminId));
+  if (!state) return;
+  state.calYear = year;
+  state.calMonth = month;
+  await botConfig.setConfig(addBlockStateKey(adminId), state);
+  const label = side === 'start' ? 'بداية' : 'نهاية';
+  await telegram.editMessageText(chatId, messageId, `⏳ اختار تاريخ <b>${label}</b> الفترة (بتوقيت القاهرة):`, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: buildCalendarButtons(side, year, month) },
+  });
+}
+
+async function handleAddBlockDatePicked(chatId, messageId, adminId, side, dateStr) {
+  const state = await botConfig.getConfig(addBlockStateKey(adminId));
+  if (!state) return;
+  const [y, m, d] = dateStr.split('-').map(Number);
+  state[`${side}Year`] = y;
+  state[`${side}Month`] = m;
+  state[`${side}Day`] = d;
+  state.stage = `${side}_hour`;
+  await botConfig.setConfig(addBlockStateKey(adminId), state);
+  const label = side === 'start' ? 'بداية' : 'نهاية';
+  await telegram.editMessageText(chatId, messageId, `🕐 اختار <b>ساعة ${label}</b> الفترة:`, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: buildHourButtons(side) },
+  });
+}
+
+async function handleAddBlockHourPicked(chatId, messageId, adminId, side, hour) {
+  const state = await botConfig.getConfig(addBlockStateKey(adminId));
+  if (!state) return;
+  state[`${side}Hour12`] = hour;
+  state.stage = `${side}_minute`;
+  await botConfig.setConfig(addBlockStateKey(adminId), state);
+  const label = side === 'start' ? 'بداية' : 'نهاية';
+  await telegram.editMessageText(chatId, messageId, `🕐 اختار <b>دقيقة ${label}</b> الفترة:`, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: buildMinuteButtons(side) },
+  });
+}
+
+async function handleAddBlockMinutePicked(chatId, messageId, adminId, side, minute) {
+  const state = await botConfig.getConfig(addBlockStateKey(adminId));
+  if (!state) return;
+  state[`${side}Minute`] = minute;
+  state.stage = `${side}_ampm`;
+  await botConfig.setConfig(addBlockStateKey(adminId), state);
+  const label = side === 'start' ? 'بداية' : 'نهاية';
+  await telegram.editMessageText(chatId, messageId, `🕐 صباحاً ولا مساءً — <b>${label}</b> الفترة؟`, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: buildAmPmButtons(side) },
+  });
+}
+
+function buildConfirmSummary(state) {
+  const labelLine = state.label ? `\nالسبب: ${escapeHtml(state.label)}` : '';
+  return (
+    `⏳ <b>تأكيد فترة الإغلاق</b>\n\n` +
+    `من: <code>${cairoTime.formatUtcIsoAsCairo(state.startAt)}</code>\n` +
+    `لحد: <code>${cairoTime.formatUtcIsoAsCairo(state.endAt)}</code> (بتوقيت القاهرة)${labelLine}\n\n` +
+    `في الفترة دي، البوت هيقف عن الرد لأي حد غير الأدمن.`
+  );
+}
+
+async function handleAddBlockAmPmPicked(chatId, messageId, adminId, side, ampm) {
+  const state = await botConfig.getConfig(addBlockStateKey(adminId));
+  if (!state) return;
+  const hour12 = state[`${side}Hour12`];
+  let hour24 = hour12 % 12;
+  if (ampm === 'PM') hour24 += 12;
+  const utcIso = cairoTime.cairoPartsToUtcIso(
+    state[`${side}Year`],
+    state[`${side}Month`],
+    state[`${side}Day`],
+    hour24,
+    Number(state[`${side}Minute`])
+  );
+  state[`${side}At`] = utcIso;
+  state[`${side}AmPm`] = ampm;
+
+  if (side === 'start') {
+    // Move on to picking the end date, defaulting the calendar view to
+    // the same month the admin just picked the start date from.
+    state.stage = 'end_date';
+    state.calYear = state.startYear;
+    state.calMonth = state.startMonth;
+    await botConfig.setConfig(addBlockStateKey(adminId), state);
+    await telegram.editMessageText(
+      chatId,
+      messageId,
+      `✅ بداية الفترة: <code>${cairoTime.formatUtcIsoAsCairo(state.startAt)}</code>\n\nدلوقتي اختار تاريخ <b>نهاية</b> الفترة:`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: buildCalendarButtons('end', state.calYear, state.calMonth) } }
+    );
+    return;
+  }
+
+  // End time picked — validate ordering before moving to the label step.
+  if (Date.parse(state.endAt) <= Date.parse(state.startAt)) {
+    await botConfig.setConfig(addBlockStateKey(adminId), state);
+    await telegram.editMessageText(
+      chatId,
+      messageId,
+      `⚠️ وقت النهاية لازم يكون بعد وقت البداية (<code>${cairoTime.formatUtcIsoAsCairo(state.startAt)}</code>).\nاختار تاريخ نهاية تاني:`,
+      {
+        parse_mode: 'HTML',
+        reply_markup: { inline_keyboard: buildCalendarButtons('end', state.endYear, state.endMonth) },
+      }
+    );
+    return;
+  }
+
+  state.stage = 'label';
+  await botConfig.setConfig(addBlockStateKey(adminId), state);
+  await telegram.editMessageText(
+    chatId,
+    messageId,
+    `✅ بداية: <code>${cairoTime.formatUtcIsoAsCairo(state.startAt)}</code>\n` +
+      `✅ نهاية: <code>${cairoTime.formatUtcIsoAsCairo(state.endAt)}</code>\n\n` +
+      `📝 ابعت السبب/الليبل (اختياري) كرسالة نصية دلوقتي، أو دوس "تخطي".`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [[{ text: '⏭ تخطي', callback_data: 'blk_label_skip' }], [{ text: '❌ إلغاء', callback_data: 'blk_cancel' }]],
+      },
+    }
+  );
+}
+
+async function handleAddBlockLabelSkip(chatId, messageId, adminId) {
+  const state = await botConfig.getConfig(addBlockStateKey(adminId));
+  if (!state) return;
+  state.label = null;
+  state.stage = 'confirm';
+  await botConfig.setConfig(addBlockStateKey(adminId), state);
+  await telegram.editMessageText(chatId, messageId, buildConfirmSummary(state), {
+    parse_mode: 'HTML',
+    reply_markup: {
+      inline_keyboard: [[{ text: '✅ تأكيد', callback_data: 'blk_confirm' }, { text: '❌ إلغاء', callback_data: 'blk_cancel' }]],
+    },
+  });
+}
+
+// Called from the plain-text message handler while a /addblock wizard is
+// waiting on the optional label. Returns true if it handled the message
+// (so the caller doesn't also try to treat it as a book action or
+// question batch).
+async function tryHandleAddBlockLabelPaste(chatId, adminId, text) {
+  const state = await botConfig.getConfig(addBlockStateKey(adminId));
+  if (!state || state.stage !== 'label') return false;
+  state.label = text.trim().slice(0, 200) || null;
+  state.stage = 'confirm';
+  await botConfig.setConfig(addBlockStateKey(adminId), state);
+  await telegram.sendMessage(chatId, buildConfirmSummary(state), {
+    parse_mode: 'HTML',
+    reply_markup: {
+      inline_keyboard: [[{ text: '✅ تأكيد', callback_data: 'blk_confirm' }, { text: '❌ إلغاء', callback_data: 'blk_cancel' }]],
+    },
+  });
+  return true;
+}
+
+async function handleAddBlockConfirm(chatId, messageId, adminId) {
+  const state = await botConfig.getConfig(addBlockStateKey(adminId));
+  if (!state || !state.startAt || !state.endAt) {
+    await telegram.editMessageText(chatId, messageId, '⚠️ الجلسة انتهت، ابدأ تاني بـ /addblock.');
+    return;
+  }
+  await botConfig.deleteConfig(addBlockStateKey(adminId));
+  const id = await botConfig.addBlockedPeriod(state.startAt, state.endAt, state.label || null);
+  const labelLine = state.label ? `\nالسبب: ${escapeHtml(state.label)}` : '';
+  await telegram.editMessageText(
+    chatId,
+    messageId,
+    `✅ اتضافت فترة إغلاق رقم <code>#${id}</code>:\n` +
+      `من ${cairoTime.formatUtcIsoAsCairo(state.startAt)} لحد ${cairoTime.formatUtcIsoAsCairo(state.endAt)} (بتوقيت القاهرة)${labelLine}\n\n` +
+      `في الفترة دي، البوت هيقف عن الرد لأي حد غير الأدمن.`,
+    { parse_mode: 'HTML' }
+  );
+}
+
+async function handleAddBlockCancel(chatId, messageId, adminId) {
+  await botConfig.deleteConfig(addBlockStateKey(adminId));
+  await telegram.editMessageText(chatId, messageId, '❌ اتلغت إضافة فترة الإغلاق.');
 }
 
 // =========================================================
@@ -940,6 +1251,94 @@ async function handleCallbackQuery(cb) {
     await botConfig.deleteConfig(`addkeybuf_${userId}`);
     await telegram.answerCallbackQuery(cb.id, { text: '❌ تم الإلغاء.' });
     await telegram.editMessageText(chatId, messageId, '❌ تم إلغاء إضافة المفتاح.');
+    return;
+  }
+
+  // ⏳ /addblock button-based date & AM/PM time picker — admin-only.
+  if (data.startsWith('blk_')) {
+    if (!isAdmin(userId)) {
+      await telegram.answerCallbackQuery(cb.id);
+      return;
+    }
+
+    if (data === 'blk_removeblock_cancel') {
+      await telegram.answerCallbackQuery(cb.id, { text: '❌ تم الإلغاء.' });
+      await telegram.editMessageText(chatId, messageId, '❌ تم الإلغاء.');
+      return;
+    }
+
+    if (data.startsWith('blk_remove_')) {
+      const id = parseInt(data.replace('blk_remove_', ''), 10);
+      await telegram.answerCallbackQuery(cb.id, { text: '✅ تم الحذف.' });
+      await handleRemoveBlockConfirmed(chatId, messageId, id);
+      return;
+    }
+
+    if (data === 'blk_noop') {
+      await telegram.answerCallbackQuery(cb.id);
+      return;
+    }
+
+    if (data === 'blk_cancel') {
+      await telegram.answerCallbackQuery(cb.id, { text: '❌ تم الإلغاء.' });
+      await handleAddBlockCancel(chatId, messageId, userId);
+      return;
+    }
+
+    if (data.startsWith('blk_navcal_')) {
+      const rest = data.replace('blk_navcal_', ''); // "<side>_<year>-<month>"
+      const [side, ym] = rest.split('_');
+      const [year, month] = ym.split('-').map(Number);
+      await telegram.answerCallbackQuery(cb.id);
+      await handleAddBlockCalendarNav(chatId, messageId, userId, side, year, month);
+      return;
+    }
+
+    if (data.startsWith('blk_date_')) {
+      const rest = data.replace('blk_date_', ''); // "<side>_<yyyy-MM-dd>"
+      const [side, dateStr] = [rest.split('_')[0], rest.slice(rest.indexOf('_') + 1)];
+      await telegram.answerCallbackQuery(cb.id);
+      await handleAddBlockDatePicked(chatId, messageId, userId, side, dateStr);
+      return;
+    }
+
+    if (data.startsWith('blk_hour_')) {
+      const rest = data.replace('blk_hour_', ''); // "<side>_<h>"
+      const [side, hour] = rest.split('_');
+      await telegram.answerCallbackQuery(cb.id);
+      await handleAddBlockHourPicked(chatId, messageId, userId, side, Number(hour));
+      return;
+    }
+
+    if (data.startsWith('blk_min_')) {
+      const rest = data.replace('blk_min_', ''); // "<side>_<mm>"
+      const [side, minute] = rest.split('_');
+      await telegram.answerCallbackQuery(cb.id);
+      await handleAddBlockMinutePicked(chatId, messageId, userId, side, minute);
+      return;
+    }
+
+    if (data.startsWith('blk_ampm_')) {
+      const rest = data.replace('blk_ampm_', ''); // "<side>_AM|PM"
+      const [side, ampm] = rest.split('_');
+      await telegram.answerCallbackQuery(cb.id);
+      await handleAddBlockAmPmPicked(chatId, messageId, userId, side, ampm);
+      return;
+    }
+
+    if (data === 'blk_label_skip') {
+      await telegram.answerCallbackQuery(cb.id);
+      await handleAddBlockLabelSkip(chatId, messageId, userId);
+      return;
+    }
+
+    if (data === 'blk_confirm') {
+      await telegram.answerCallbackQuery(cb.id, { text: '✅ تم الحفظ.' });
+      await handleAddBlockConfirm(chatId, messageId, userId);
+      return;
+    }
+
+    await telegram.answerCallbackQuery(cb.id);
     return;
   }
 
@@ -1109,12 +1508,20 @@ async function tryHandleAdminCommand(chatId, adminId, text) {
     await handleAddBlock(chatId, text.replace('/addblock ', '').trim());
     return true;
   }
+  if (text === '/addblock') {
+    await handleAddBlockStart(chatId, adminId);
+    return true;
+  }
   if (text === '/blocklist') {
     await handleBlockList(chatId);
     return true;
   }
   if (text.startsWith('/removeblock ')) {
     await handleRemoveBlock(chatId, text.replace('/removeblock ', '').trim());
+    return true;
+  }
+  if (text === '/removeblock') {
+    await handleRemoveBlockPrompt(chatId);
     return true;
   }
   return false;
@@ -1282,9 +1689,17 @@ module.exports = async (req, res) => {
         // /addkey is pending), otherwise treat it as a batch of questions.
         const handledAsBookRename = admin && (await tryHandleBookRenamePaste(chatId, fromUser.id, text));
         const handledAsNewBookName = !handledAsBookRename && admin && (await tryHandleAddBookNamePaste(chatId, fromUser.id, text));
+        const handledAsAddBlockLabel =
+          !handledAsBookRename &&
+          !handledAsNewBookName &&
+          admin &&
+          (await tryHandleAddBlockLabelPaste(chatId, fromUser.id, text));
         const handledAsKeyPaste =
-          !handledAsBookRename && !handledAsNewBookName && (await tryHandleAddKeyPaste(chatId, fromUser.id, text));
-        if (!handledAsBookRename && !handledAsNewBookName && !handledAsKeyPaste) {
+          !handledAsBookRename &&
+          !handledAsNewBookName &&
+          !handledAsAddBlockLabel &&
+          (await tryHandleAddKeyPaste(chatId, fromUser.id, text));
+        if (!handledAsBookRename && !handledAsNewBookName && !handledAsAddBlockLabel && !handledAsKeyPaste) {
           const questions = extractQuestionsFromText(text).slice(0, MAX_QUESTIONS);
           await handleQuestionsBatch(chatId, questions, fromUser);
         }
