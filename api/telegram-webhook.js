@@ -1,6 +1,7 @@
 const env = require('../lib/env');
 const telegram = require('../lib/telegram');
 const books = require('../lib/books');
+const gemini = require('../lib/gemini');
 const { keywordSearchChunks, debugRetrieve } = require('../lib/rag');
 const {
   MAX_QUESTIONS,
@@ -65,10 +66,11 @@ function bookNameFromFileName(fileName) {
   return fileName.replace(/\.pdf$/i, '').replace(/[_-]+/g, ' ').trim() || 'كتاب بدون اسم';
 }
 
-// Admin PDF upload = add a new book (existing books are untouched — many
-// books can coexist, each user picks one via /mybook). The book's name
-// comes from, in order of priority: (1) a name staged via /addbook <name>
-// right before the upload, (2) the document's caption, (3) the filename.
+// Called only when the admin explicitly started the "➕ إضافة كتاب جديد"
+// button flow and already typed the book's name (staged in
+// addbookbuf_<adminId> — see handleAddBookStart). A PDF from the admin
+// with no such pending name is treated as a normal question document
+// instead (see the document dispatch in the main webhook handler).
 async function handleBookUpload(chatId, adminId, fileId, fileName, caption) {
   const pending = await botConfig.getConfig(`addbookbuf_${adminId}`);
   if (pending?.name) await botConfig.deleteConfig(`addbookbuf_${adminId}`);
@@ -116,11 +118,61 @@ async function resolveBookForUser(fromUser) {
   return { readyBooks, book: null };
 }
 
+// Groups the raw generationCalls/embeddingCalls collected during a
+// request into one readable admin report: which key(s)/model(s)
+// succeeded, whether any fallback attempts happened along the way, and
+// which questions ultimately failed — all as a single message instead of
+// one notification per Gemini call.
+function buildUsageReportLines(usage) {
+  const lines = [];
+
+  const successfulGen = usage.generationCalls.filter((g) => !g.failed);
+  if (successfulGen.length > 0) {
+    const counts = {};
+    successfulGen.forEach((g) => {
+      const label = `${g.keyLabel} · ${g.model}`;
+      counts[label] = (counts[label] || 0) + 1;
+    });
+    const keyLines = Object.entries(counts)
+      .map(([label, n]) => `• ${label}${n > 1 ? ` (×${n})` : ''}`)
+      .join('\n');
+    lines.push(`🔑 <b>المفتاح/الموديل اللي نجح:</b>\n${keyLines}`);
+  }
+
+  if (usage.embeddingCalls.length > 0) {
+    const embedLabels = [...new Set(usage.embeddingCalls.map((e) => e.keyLabel))];
+    lines.push(`🔎 <b>مفتاح الـ embedding:</b> ${embedLabels.join('، ')}`);
+  }
+
+  const fallbackAttempts = usage.generationCalls.flatMap((g) => g.attempts || []);
+  if (fallbackAttempts.length > 0) {
+    lines.push(
+      `⚠️ <b>حصل fallback (${fallbackAttempts.length} محاولة فشلت قبل النجاح):</b>\n${gemini.formatAttemptLog(fallbackAttempts)}`
+    );
+  }
+
+  if (usage.failures.length > 0) {
+    const shown = usage.failures.slice(0, 10);
+    const failLines = shown
+      .map((f, i) => {
+        const trimmed = f.errMessage.length > 300 ? `${f.errMessage.slice(0, 300)}…` : f.errMessage;
+        return `${i + 1}. ${escapeHtml(f.question)}\nالسبب: <code>${escapeHtml(trimmed)}</code>`;
+      })
+      .join('\n\n');
+    const more = usage.failures.length > shown.length ? `\n\n(+${usage.failures.length - shown.length} سؤال تاني فشل)` : '';
+    lines.push(`🟠 <b>أسئلة فشلت نهائياً بعد كل المحاولات (${usage.failures.length}):</b>\n${failLines}${more}`);
+  }
+
+  return lines;
+}
+
 // fromUser (optional): the Telegram `from` object of whoever sent the
 // questions. When provided: (1) their own validated Gemini keys (if they
 // have MIN_USER_KEYS_FOR_BOOST or more) are pooled in for this request
 // only, giving them extra headroom beyond the shared bot quota, and (2)
-// admins get a one-line completion report with the success rate.
+// admins get ONE consolidated report at the end covering the user, the
+// success rate, which key(s)/model(s) were used, any fallback attempts,
+// and any questions that ultimately failed.
 async function handleQuestionsBatch(chatId, questions, fromUser = null) {
   const { readyBooks, book } = await resolveBookForUser(fromUser);
 
@@ -156,6 +208,11 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
     ? `${escapeHtml(fromUser.first_name || '')}${fromUser.username ? ' (@' + escapeHtml(fromUser.username) + ')' : ''} — <code>${fromUser.id}</code>`
     : `<code>${chatId}</code>`;
 
+  // Collects "which key/model was used" + "which questions ultimately
+  // failed" across every Gemini call made for this request, so exactly
+  // ONE admin report gets sent at the end instead of one per call.
+  const usage = { embeddingCalls: [], generationCalls: [], failures: [] };
+
   try {
     let extraKeys = [];
     if (fromUser) {
@@ -164,13 +221,7 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
         extraKeys = ownKeys.map((k) => k.api_key);
       }
     }
-    const results = await answerQuestions(questions, book.id, extraKeys, async (question, errMessage) => {
-      const trimmed = errMessage.length > 1500 ? `${errMessage.slice(0, 1500)}…` : errMessage;
-      await notifyAdmins(
-        `🟠 <b>فشل سؤال بعد كل المحاولات</b>\n👤 ${userLabel}\n❓ ${escapeHtml(question)}\nالسبب الحقيقي: <code>${escapeHtml(trimmed)}</code>`,
-        { parse_mode: 'HTML' }
-      );
-    });
+    const results = await answerQuestions(questions, book.id, extraKeys, usage);
     await telegram.sendLongMessage(chatId, formatResults(results));
 
     // A question counts as "successfully answered" when Gemini matched
@@ -179,10 +230,15 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
     // page: null and don't count toward the success rate.
     const total = results.length;
     const success = results.filter((r) => !r.isError && r.page !== null).length;
-    await notifyAdmins(
-      `📊 <b>تقرير معالجة أسئلة</b>\n👤 ${userLabel}\n📖 ${escapeHtml(book.name)}\n✅ <b>${success}/${total}</b> سؤال اتجاوب عليه من الكتاب.`,
-      { parse_mode: 'HTML' }
-    );
+
+    const reportLines = [
+      `📊 <b>تقرير معالجة أسئلة</b>`,
+      `👤 ${userLabel}`,
+      `📖 ${escapeHtml(book.name)}`,
+      `✅ <b>${success}/${total}</b> سؤال اتجاوب عليه من الكتاب.`,
+      ...buildUsageReportLines(usage),
+    ];
+    await notifyAdmins(reportLines.join('\n\n'), { parse_mode: 'HTML' });
   } catch (err) {
     console.error('Answering failed:', err);
     if (err instanceof DailyLimitReachedError) {
@@ -190,18 +246,27 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
     } else {
       await telegram.sendMessage(chatId, `❌ حصل خطأ أثناء البحث عن الإجابات:\n${err.message}`);
     }
-    await notifyAdmins(
-      `🛑 <b>فشلت معالجة أسئلة</b>\n👤 ${userLabel}\n📄 عدد الأسئلة: <code>${questions.length}</code>\nالسبب: <code>${escapeHtml(err.message)}</code>`,
-      { parse_mode: 'HTML' }
-    );
+    const reportLines = [
+      `🛑 <b>فشلت معالجة أسئلة</b>`,
+      `👤 ${userLabel}`,
+      `📄 عدد الأسئلة: <code>${questions.length}</code>`,
+      `السبب: <code>${escapeHtml(err.message)}</code>`,
+      ...buildUsageReportLines(usage),
+    ];
+    await notifyAdmins(reportLines.join('\n\n'), { parse_mode: 'HTML' });
   }
 }
 
-async function handleStatusCommand(chatId) {
+// Builds the text + inline keyboard for the admin book list/management
+// screen. Shared by the /books /status commands (new message) and the
+// "🔙 رجوع" callback (edits the existing message back to this view).
+async function buildBooksOverview() {
   const allBooks = await books.listBooks();
   if (allBooks.length === 0) {
-    await telegram.sendMessage(chatId, 'لسه مفيش أي كتاب مضاف. استخدم /addbook ثم ابعت PDF.');
-    return;
+    return {
+      text: 'لسه مفيش أي كتاب مضاف. اضغط الزر تحت عشان تضيف كتاب.',
+      reply_markup: { inline_keyboard: [[{ text: '➕ إضافة كتاب جديد', callback_data: 'cmd_addbooknew' }]] },
+    };
   }
   const lines = allBooks.map((b) => {
     const parts = [
@@ -215,20 +280,147 @@ async function handleStatusCommand(chatId) {
     return parts.join('\n');
   });
   lines.push(`موديل الـ embedding الحالي: ${env.GEMINI_EMBEDDING_MODEL}`);
-  await telegram.sendMessage(chatId, lines.join('\n\n'), { parse_mode: 'HTML' });
+  lines.push('اختار كتاب تحت عشان تغيّر اسمه أو تحذفه:');
+
+  const buttons = allBooks.map((b) => [{ text: `⚙️ ${b.name}`, callback_data: `cmd_bookmenu_${b.id}` }]);
+  buttons.push([{ text: '➕ إضافة كتاب جديد', callback_data: 'cmd_addbooknew' }]);
+
+  return { text: lines.join('\n\n'), reply_markup: { inline_keyboard: buttons } };
+}
+
+async function handleStatusCommand(chatId) {
+  const { text, reply_markup } = await buildBooksOverview();
+  await telegram.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup });
 }
 
 async function handleBooksList(chatId) {
   return handleStatusCommand(chatId);
 }
 
-async function handleAddBookStart(chatId, adminId, name) {
-  if (!name) {
-    await telegram.sendMessage(chatId, '⚠️ استخدم: <code>/addbook اسم الكتاب</code>، وبعدين ابعت ملف الـ PDF.', {
-      parse_mode: 'HTML',
-    });
+// Edits an existing admin message back to the book overview (used by the
+// "🔙 رجوع" button so browsing books/renaming/deleting stays in one
+// message instead of spamming new ones).
+async function handleBooksBackButton(chatId, messageId) {
+  const { text, reply_markup } = await buildBooksOverview();
+  await telegram.editMessageText(chatId, messageId, text, { parse_mode: 'HTML', reply_markup });
+}
+
+// Per-book management submenu: rename / delete / back. Reached by
+// tapping a book in the overview list (⚙️ <name>).
+async function handleBookMenuButton(chatId, messageId, bookId) {
+  const book = await books.getBook(bookId);
+  if (!book) {
+    await telegram.editMessageText(chatId, messageId, '❌ الكتاب ده اتحذف بالفعل.');
     return;
   }
+  const text =
+    `📖 <b>${escapeHtml(book.name)}</b> (ID: <code>${book.id}</code>)\n` +
+    `الحالة: ${book.status}${book.total_pages ? `\nعدد الصفحات: ${book.total_pages}` : ''}\n\n` +
+    `اختار إجراء:`;
+  await telegram.editMessageText(chatId, messageId, text, {
+    parse_mode: 'HTML',
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '✏️ تغيير الاسم', callback_data: `cmd_bookrename_${book.id}` }],
+        [{ text: '🗑 حذف الكتاب', callback_data: `cmd_bookdelete_${book.id}` }],
+        [{ text: '🔙 رجوع', callback_data: 'cmd_booksback' }],
+      ],
+    },
+  });
+}
+
+// Puts the admin into "waiting to type the new name" mode for a book.
+async function handleBookRenameStart(chatId, messageId, adminId, bookId) {
+  const book = await books.getBook(bookId);
+  if (!book) {
+    await telegram.editMessageText(chatId, messageId, '❌ الكتاب ده اتحذف بالفعل.');
+    return;
+  }
+  await botConfig.setConfig(`renamebook_${adminId}`, { bookId });
+  await telegram.editMessageText(
+    chatId,
+    messageId,
+    `✏️ ابعت الاسم الجديد لكتاب "${escapeHtml(book.name)}" دلوقت كرسالة نصية.`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '❌ إلغاء', callback_data: `cmd_bookmenu_${bookId}` }]] },
+    }
+  );
+}
+
+// Called when a plain-text message arrives while the admin is in
+// "waiting to type a new book name" mode (set by handleBookRenameStart).
+// Returns true if it handled the message.
+async function tryHandleBookRenamePaste(chatId, adminId, text) {
+  const state = await botConfig.getConfig(`renamebook_${adminId}`);
+  if (!state || !state.bookId) return false;
+
+  await botConfig.deleteConfig(`renamebook_${adminId}`);
+  const newName = text.trim();
+  if (!newName) {
+    await telegram.sendMessage(chatId, '⚠️ الاسم فاضي، اتلغت العملية. استخدم /books تاني لو عايز تحاول.');
+    return true;
+  }
+  const book = await books.getBook(state.bookId);
+  if (!book) {
+    await telegram.sendMessage(chatId, '❌ الكتاب ده اتحذف بالفعل.');
+    return true;
+  }
+  await books.renameBook(state.bookId, newName);
+  await telegram.sendMessage(chatId, `✅ تم تغيير اسم الكتاب من "${escapeHtml(book.name)}" إلى "${escapeHtml(newName)}".`, {
+    parse_mode: 'HTML',
+  });
+  return true;
+}
+
+async function handleBookDeleteConfirmPrompt(chatId, messageId, bookId) {
+  const book = await books.getBook(bookId);
+  if (!book) {
+    await telegram.editMessageText(chatId, messageId, '❌ الكتاب ده اتحذف بالفعل.');
+    return;
+  }
+  await telegram.editMessageText(
+    chatId,
+    messageId,
+    `⚠️ متأكد إنك عايز تحذف الكتاب "${escapeHtml(book.name)}"؟ الإجراء ده نهائي.`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '✅ نعم، احذف', callback_data: `cmd_bookdeleteconfirm_${bookId}` }],
+          [{ text: '❌ إلغاء', callback_data: `cmd_bookmenu_${bookId}` }],
+        ],
+      },
+    }
+  );
+}
+
+async function handleBookDeleteConfirmed(chatId, messageId, bookId) {
+  const book = await books.getBook(bookId);
+  if (!book) {
+    await telegram.editMessageText(chatId, messageId, '❌ الكتاب ده اتحذف بالفعل.');
+    return;
+  }
+  await books.deleteBook(bookId);
+  await telegram.editMessageText(chatId, messageId, `✅ تم حذف الكتاب "${escapeHtml(book.name)}" (ID: ${bookId}).`, {
+    parse_mode: 'HTML',
+  });
+}
+
+// Puts the admin into "waiting to type a name for the new book" mode
+// (button-driven equivalent of typing /addbook <name>).
+async function handleAddBookNewPrompt(chatId, messageId, adminId) {
+  await botConfig.setConfig(`addbook_waitname_${adminId}`, { active: true });
+  await telegram.editMessageText(chatId, messageId, '📚 ابعت اسم الكتاب الجديد دلوقت كرسالة نصية.', {
+    reply_markup: { inline_keyboard: [[{ text: '❌ إلغاء', callback_data: 'cmd_booksback' }]] },
+  });
+}
+
+// Stages the given name for the admin's very next PDF upload (only
+// reached via the "➕ إضافة كتاب جديد" button flow — see
+// tryHandleAddBookNamePaste below).
+async function handleAddBookStart(chatId, adminId, name) {
+  if (!name) return;
   await botConfig.setConfig(`addbookbuf_${adminId}`, { name });
   await telegram.sendMessage(
     chatId,
@@ -236,23 +428,22 @@ async function handleAddBookStart(chatId, adminId, name) {
   );
 }
 
-async function handleDeleteBook(chatId, bookIdRaw) {
-  const bookId = Number(bookIdRaw);
-  if (!bookIdRaw || Number.isNaN(bookId)) {
-    await telegram.sendMessage(chatId, '⚠️ استخدم: <code>/deletebook ID</code> — استخدم /books عشان تعرف الـ IDs.', {
-      parse_mode: 'HTML',
-    });
-    return;
+// Called when a plain-text message arrives while the admin is in
+// "waiting to type a new book's name" mode (set by handleAddBookNewPrompt,
+// the button flow). Delegates to the existing handleAddBookStart so the
+// following-PDF-upload step stages the book's name the same way.
+async function tryHandleAddBookNamePaste(chatId, adminId, text) {
+  const state = await botConfig.getConfig(`addbook_waitname_${adminId}`);
+  if (!state || !state.active) return false;
+
+  await botConfig.deleteConfig(`addbook_waitname_${adminId}`);
+  const name = text.trim();
+  if (!name) {
+    await telegram.sendMessage(chatId, '⚠️ الاسم فاضي، اتلغت العملية. اضغط "➕ إضافة كتاب جديد" تاني لو عايز تحاول.');
+    return true;
   }
-  const book = await books.getBook(bookId);
-  if (!book) {
-    await telegram.sendMessage(chatId, `❌ مفيش كتاب بـ ID: ${bookId}.`);
-    return;
-  }
-  await books.deleteBook(bookId);
-  await telegram.sendMessage(chatId, `✅ تم حذف الكتاب "${escapeHtml(book.name)}" (ID: ${bookId}).`, {
-    parse_mode: 'HTML',
-  });
+  await handleAddBookStart(chatId, adminId, name);
+  return true;
 }
 
 // =========================================================
@@ -343,10 +534,8 @@ async function handleAdminHelp(chatId) {
     `• <code>/stats</code> — إحصائيات عامة (مستخدمين، إجابات محفوظة).\n` +
     `• <code>/user USER_ID</code> — تقرير عن مستخدم معين.\n\n` +
     `📚 <b>إدارة الكتب:</b>\n` +
-    `• <code>/addbook اسم الكتاب</code> ثم ابعت ملف PDF — إضافة كتاب جديد (من غير ما يمسح أي كتاب موجود).\n` +
-    `• ابعت PDF بدون /addbook — هياخد اسمه من الـ caption لو موجود، أو من اسم الملف.\n` +
-    `• <code>/books</code> أو <code>/status</code> — عرض كل الكتب وحالتها.\n` +
-    `• <code>/deletebook ID</code> — حذف كتاب.\n` +
+    `• <code>/books</code> أو <code>/status</code> — عرض كل الكتب مع أزرار لكل كتاب (تغيير الاسم / حذف) وزر لإضافة كتاب جديد.\n` +
+    `• إضافة/تغيير اسم/حذف كتاب بيتم بالأزرار بس (مفيش أوامر نصية للحاجات دي). لو بعتّ PDF من غير ما تدوس "➕ إضافة كتاب جديد" الأول، هيتعامل معاه كملف أسئلة عادي زي أي مستخدم.\n` +
     `• <code>/search كلمة</code> و <code>/debug سؤال</code> — أدوات تشخيصية على كل الكتب.\n\n` +
     `⚙️ <b>الإعدادات العامة:</b>\n` +
     `• <code>/setwelcome النص</code> — تغيير رسالة الترحيب عند /start.\n` +
@@ -680,6 +869,51 @@ async function handleCallbackQuery(cb) {
     return;
   }
 
+  // 📚 Admin book management buttons (all admin-only; silently ack for
+  // anyone else since these callback_data values only ever get sent to
+  // admins in the first place).
+  if (data.startsWith('cmd_book') || data === 'cmd_addbooknew' || data === 'cmd_booksback') {
+    if (!isAdmin(userId)) {
+      await telegram.answerCallbackQuery(cb.id);
+      return;
+    }
+
+    if (data === 'cmd_booksback') {
+      await telegram.answerCallbackQuery(cb.id);
+      await handleBooksBackButton(chatId, messageId);
+      return;
+    }
+    if (data === 'cmd_addbooknew') {
+      await telegram.answerCallbackQuery(cb.id);
+      await handleAddBookNewPrompt(chatId, messageId, userId);
+      return;
+    }
+    if (data.startsWith('cmd_bookmenu_')) {
+      const bookId = Number(data.replace('cmd_bookmenu_', ''));
+      await telegram.answerCallbackQuery(cb.id);
+      await handleBookMenuButton(chatId, messageId, bookId);
+      return;
+    }
+    if (data.startsWith('cmd_bookrename_')) {
+      const bookId = Number(data.replace('cmd_bookrename_', ''));
+      await telegram.answerCallbackQuery(cb.id);
+      await handleBookRenameStart(chatId, messageId, userId, bookId);
+      return;
+    }
+    if (data.startsWith('cmd_bookdeleteconfirm_')) {
+      const bookId = Number(data.replace('cmd_bookdeleteconfirm_', ''));
+      await telegram.answerCallbackQuery(cb.id, { text: '✅ تم الحذف.' });
+      await handleBookDeleteConfirmed(chatId, messageId, bookId);
+      return;
+    }
+    if (data.startsWith('cmd_bookdelete_')) {
+      const bookId = Number(data.replace('cmd_bookdelete_', ''));
+      await telegram.answerCallbackQuery(cb.id);
+      await handleBookDeleteConfirmPrompt(chatId, messageId, bookId);
+      return;
+    }
+  }
+
   if (data.startsWith('cmd_selectbook_')) {
     const bookId = Number(data.replace('cmd_selectbook_', ''));
     const book = await books.getBook(bookId);
@@ -745,14 +979,6 @@ async function tryHandleAdminCommand(chatId, adminId, text) {
   }
   if (text === '/books') {
     await handleBooksList(chatId);
-    return true;
-  }
-  if (text.startsWith('/addbook ')) {
-    await handleAddBookStart(chatId, adminId, text.replace('/addbook ', '').trim());
-    return true;
-  }
-  if (text.startsWith('/deletebook ')) {
-    await handleDeleteBook(chatId, text.replace('/deletebook ', '').trim());
     return true;
   }
   if (text.startsWith('/setwelcome ')) {
@@ -838,7 +1064,9 @@ module.exports = async (req, res) => {
       const isNewUser = await users.upsertUserAndCheckNew(fromUser);
       if (isNewUser && !admin) {
         const label = `${escapeHtml(fromUser.first_name || '')}${fromUser.username ? ' (@' + escapeHtml(fromUser.username) + ')' : ''} — <code>${fromUser.id}</code>`;
-        await notifyAdmins(`🆕 <b>مستخدم جديد:</b>\n${label}`, { parse_mode: 'HTML' });
+        const totalUsers = await users.getTotalUserCount();
+        const totalLine = totalUsers !== null ? `\n👥 إجمالي المستخدمين الآن: <code>${totalUsers}</code>` : '';
+        await notifyAdmins(`🆕 <b>مستخدم جديد:</b>\n${label}${totalLine}`, { parse_mode: 'HTML' });
       }
     }
 
@@ -928,10 +1156,14 @@ module.exports = async (req, res) => {
       } else if (text.startsWith('/')) {
         await telegram.sendMessage(chatId, 'ابعتلي سؤال أو أكتر (سؤال في كل سطر) وهدور عليهم في الكتاب.');
       } else {
-        // Plain text: could be a Gemini key being pasted (if /addkey is
-        // pending), otherwise treat it as a batch of questions.
-        const handledAsKeyPaste = await tryHandleAddKeyPaste(chatId, fromUser.id, text);
-        if (!handledAsKeyPaste) {
+        // Plain text: could be a pending admin book action (rename / new
+        // book name from the button flow), a Gemini key being pasted (if
+        // /addkey is pending), otherwise treat it as a batch of questions.
+        const handledAsBookRename = admin && (await tryHandleBookRenamePaste(chatId, fromUser.id, text));
+        const handledAsNewBookName = !handledAsBookRename && admin && (await tryHandleAddBookNamePaste(chatId, fromUser.id, text));
+        const handledAsKeyPaste =
+          !handledAsBookRename && !handledAsNewBookName && (await tryHandleAddKeyPaste(chatId, fromUser.id, text));
+        if (!handledAsBookRename && !handledAsNewBookName && !handledAsKeyPaste) {
           const questions = extractQuestionsFromText(text).slice(0, MAX_QUESTIONS);
           await handleQuestionsBatch(chatId, questions, fromUser);
         }
