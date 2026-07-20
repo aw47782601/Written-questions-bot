@@ -915,11 +915,14 @@ function buildHourButtons(side) {
 }
 
 function buildMinuteButtons(side) {
-  const minutes = ['00', '15', '30', '45'];
-  return [
-    minutes.map((m) => ({ text: `:${m}`, callback_data: `blk_min_${side}_${m}` })),
-    [{ text: '❌ إلغاء', callback_data: 'blk_cancel' }],
-  ];
+  const minutes = ['00', '05', '10', '15', '20', '25', '30', '35', '40', '45', '50', '55'];
+  const rows = [];
+  for (let i = 0; i < minutes.length; i += 4) {
+    rows.push(minutes.slice(i, i + 4).map((m) => ({ text: `:${m}`, callback_data: `blk_min_${side}_${m}` })));
+  }
+  rows.push([{ text: '✏️ اكتب رقم تاني', callback_data: `blk_mincustom_${side}` }]);
+  rows.push([{ text: '❌ إلغاء', callback_data: 'blk_cancel' }]);
+  return rows;
 }
 
 function buildAmPmButtons(side) {
@@ -986,16 +989,60 @@ async function handleAddBlockHourPicked(chatId, messageId, adminId, side, hour) 
 }
 
 async function handleAddBlockMinutePicked(chatId, messageId, adminId, side, minute) {
+  await advanceFromMinute(chatId, adminId, side, minute, { messageId });
+}
+
+// Switches the minute step from the :00/:05/.../:55 grid into "type any
+// number 0-59" mode.
+async function handleAddBlockMinuteCustomPrompt(chatId, messageId, adminId, side) {
+  const state = await botConfig.getConfig(addBlockStateKey(adminId));
+  if (!state) return;
+  state.stage = `${side}_minute_custom`;
+  await botConfig.setConfig(addBlockStateKey(adminId), state);
+  const label = side === 'start' ? 'بداية' : 'نهاية';
+  await telegram.editMessageText(
+    chatId,
+    messageId,
+    `✏️ اكتب رقم الدقيقة (من 0 لـ 59) لـ <b>${label}</b> الفترة كرسالة نصية:`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❌ إلغاء', callback_data: 'blk_cancel' }]] } }
+  );
+}
+
+// Shared step after a minute value is known (from either the quick-pick
+// grid or a typed number), advancing the wizard to the AM/PM step. Edits
+// the existing picker message when messageId is given (button tap);
+// otherwise sends a new message (typed-number path, which has no
+// message of its own to edit).
+async function advanceFromMinute(chatId, adminId, side, minute, { messageId = null } = {}) {
   const state = await botConfig.getConfig(addBlockStateKey(adminId));
   if (!state) return;
   state[`${side}Minute`] = minute;
   state.stage = `${side}_ampm`;
   await botConfig.setConfig(addBlockStateKey(adminId), state);
   const label = side === 'start' ? 'بداية' : 'نهاية';
-  await telegram.editMessageText(chatId, messageId, `🕐 صباحاً ولا مساءً — <b>${label}</b> الفترة؟`, {
-    parse_mode: 'HTML',
-    reply_markup: { inline_keyboard: buildAmPmButtons(side) },
-  });
+  const text = `🕐 صباحاً ولا مساءً — <b>${label}</b> الفترة؟`;
+  const extra = { parse_mode: 'HTML', reply_markup: { inline_keyboard: buildAmPmButtons(side) } };
+  if (messageId) {
+    await telegram.editMessageText(chatId, messageId, text, extra);
+  } else {
+    await telegram.sendMessage(chatId, text, extra);
+  }
+}
+
+// Called from the plain-text message handler while a /addblock wizard is
+// waiting on a typed custom minute (0-59). Returns true if it handled the
+// message.
+async function tryHandleAddBlockMinutePaste(chatId, adminId, text) {
+  const state = await botConfig.getConfig(addBlockStateKey(adminId));
+  if (!state || !state.stage || !state.stage.endsWith('_minute_custom')) return false;
+  const side = state.stage.replace('_minute_custom', '');
+  const num = parseInt(text.trim(), 10);
+  if (Number.isNaN(num) || num < 0 || num > 59) {
+    await telegram.sendMessage(chatId, '⚠️ اكتب رقم صحيح من 0 لـ 59.');
+    return true;
+  }
+  await advanceFromMinute(chatId, adminId, side, String(num).padStart(2, '0'));
+  return true;
 }
 
 function buildConfirmSummary(state) {
@@ -1307,6 +1354,13 @@ async function handleCallbackQuery(cb) {
       const [side, hour] = rest.split('_');
       await telegram.answerCallbackQuery(cb.id);
       await handleAddBlockHourPicked(chatId, messageId, userId, side, Number(hour));
+      return;
+    }
+
+    if (data.startsWith('blk_mincustom_')) {
+      const side = data.replace('blk_mincustom_', '');
+      await telegram.answerCallbackQuery(cb.id);
+      await handleAddBlockMinuteCustomPrompt(chatId, messageId, userId, side);
       return;
     }
 
@@ -1689,17 +1743,30 @@ module.exports = async (req, res) => {
         // /addkey is pending), otherwise treat it as a batch of questions.
         const handledAsBookRename = admin && (await tryHandleBookRenamePaste(chatId, fromUser.id, text));
         const handledAsNewBookName = !handledAsBookRename && admin && (await tryHandleAddBookNamePaste(chatId, fromUser.id, text));
+        const handledAsAddBlockMinute =
+          !handledAsBookRename &&
+          !handledAsNewBookName &&
+          admin &&
+          (await tryHandleAddBlockMinutePaste(chatId, fromUser.id, text));
         const handledAsAddBlockLabel =
           !handledAsBookRename &&
           !handledAsNewBookName &&
+          !handledAsAddBlockMinute &&
           admin &&
           (await tryHandleAddBlockLabelPaste(chatId, fromUser.id, text));
         const handledAsKeyPaste =
           !handledAsBookRename &&
           !handledAsNewBookName &&
+          !handledAsAddBlockMinute &&
           !handledAsAddBlockLabel &&
           (await tryHandleAddKeyPaste(chatId, fromUser.id, text));
-        if (!handledAsBookRename && !handledAsNewBookName && !handledAsAddBlockLabel && !handledAsKeyPaste) {
+        if (
+          !handledAsBookRename &&
+          !handledAsNewBookName &&
+          !handledAsAddBlockMinute &&
+          !handledAsAddBlockLabel &&
+          !handledAsKeyPaste
+        ) {
           const questions = extractQuestionsFromText(text).slice(0, MAX_QUESTIONS);
           await handleQuestionsBatch(chatId, questions, fromUser);
         }
