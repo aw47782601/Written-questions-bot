@@ -8,7 +8,10 @@
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.45.0",
+    "arabic-reshaper": "^1.1.0",
+    "bidi-js": "^1.0.3",
     "luxon": "^3.7.2",
-    "pdf-parse": "^1.1.1"
+    "pdf-parse": "^1.1.1",
+    "pdfkit": "^0.19.1"
   }
 }
