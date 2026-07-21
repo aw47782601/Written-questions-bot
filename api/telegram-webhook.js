@@ -10,9 +10,11 @@ const {
   extractQuestionsFromText,
 } = require('../lib/questionExtractor');
 const { answerQuestions } = require('../lib/batchAnswer');
+const { generateAnswersPdf } = require('../lib/pdfGenerator');
 const { DailyLimitReachedError } = require('../lib/usageTracker');
 const botConfig = require('../lib/botConfig');
 const users = require('../lib/users');
+const pendingBatches = require('../lib/pendingBatches');
 const userApiKeys = require('../lib/userApiKeys');
 const telegramUpdates = require('../lib/telegramUpdates');
 const cairoTime = require('../lib/cairoTime');
@@ -65,6 +67,30 @@ function formatResults(results) {
 
 function bookNameFromFileName(fileName) {
   return fileName.replace(/\.pdf$/i, '').replace(/[_-]+/g, ' ').trim() || 'كتاب بدون اسم';
+}
+
+// =========================================================
+// 📝📄 Per-batch answer format — every time a user sends questions,
+// they're asked (via inline buttons) whether they want the answers as
+// plain Telegram text, a generated PDF styled like the reference book
+// (see lib/pdfGenerator.js), or both. Nothing is persisted across
+// batches — this replaces the old /format command + standing
+// users.answer_format preference (see lib/users.js and
+// migrations/add_answer_format.sql for the history).
+// =========================================================
+
+const FORMAT_LABELS = {
+  text: '📝 نص فقط',
+  pdf: '📄 PDF فقط',
+  both: '📝📄 نص + PDF',
+};
+const VALID_ANSWER_FORMATS = Object.keys(FORMAT_LABELS);
+
+function buildFormatKeyboard(token) {
+  const buttons = Object.entries(FORMAT_LABELS).map(([value, label]) => [
+    { text: label, callback_data: `ansfmt_${value}_${token}` },
+  ]);
+  return { inline_keyboard: buttons };
 }
 
 // Called only when the admin explicitly started the "➕ إضافة كتاب جديد"
@@ -174,6 +200,12 @@ function buildUsageReportLines(usage) {
 // admins get ONE consolidated report at the end covering the user, the
 // success rate, which key(s)/model(s) were used, any fallback attempts,
 // and any questions that ultimately failed.
+// Entry point for every incoming batch of questions (typed or from a
+// document). Resolves the book and validates the questions same as
+// before, then — instead of immediately answering — stages the batch and
+// asks the user which format they want THIS batch delivered in. The
+// actual Gemini call + delivery happens in processBatchWithFormat, once
+// they tap a button (see the ansfmt_ callback handler).
 async function handleQuestionsBatch(chatId, questions, fromUser = null) {
   const { readyBooks, book } = await resolveBookForUser(fromUser);
 
@@ -198,13 +230,29 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
     return;
   }
 
-  if (questions.length > 1) {
-    await telegram.sendMessage(
-      chatId,
-      `🔎 استلمت ${questions.length} سؤال، جاري البحث في "${book.name}"...`
-    );
+  // fromUser is null only for odd edge cases (no `from` on the update) —
+  // there's no one to key a pending-batch/callback flow to, so just fall
+  // back to answering directly as plain text like before.
+  if (!fromUser) {
+    await processBatchWithFormat(chatId, questions, book, null, 'text');
+    return;
   }
 
+  const token = await pendingBatches.stageBatch(fromUser.id, { questions, bookId: book.id });
+  const countLine =
+    questions.length > 1
+      ? `🔎 استلمت ${questions.length} سؤال من "${book.name}".`
+      : `🔎 استلمت سؤالك من "${book.name}".`;
+  await telegram.sendMessage(chatId, `${countLine}\n\n📝📄 عايز تستلم الإجابة/الإجابات إزاي؟`, {
+    reply_markup: buildFormatKeyboard(token),
+  });
+}
+
+// Does the actual Gemini answering + delivery in the chosen format, plus
+// the admin usage report. Called once the user has picked a format for
+// this specific batch (or immediately, for the fromUser === null edge
+// case — see handleQuestionsBatch).
+async function processBatchWithFormat(chatId, questions, book, fromUser, format) {
   const userLabel = fromUser
     ? `${escapeHtml(fromUser.first_name || '')}${fromUser.username ? ' (@' + escapeHtml(fromUser.username) + ')' : ''} — <code>${fromUser.id}</code>`
     : `<code>${chatId}</code>`;
@@ -223,7 +271,34 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
       }
     }
     const results = await answerQuestions(questions, book.id, extraKeys, usage);
-    await telegram.sendLongMessage(chatId, formatResults(results));
+
+    const wantsText = format === 'text' || format === 'both';
+    const wantsPdf = format === 'pdf' || format === 'both';
+
+    if (wantsText) {
+      await telegram.sendLongMessage(chatId, formatResults(results));
+    }
+    let pdfSent = false;
+    if (wantsPdf) {
+      try {
+        const pdfBuffer = await generateAnswersPdf(results, {
+          title: 'إجابات الأسئلة',
+          bookName: book.name,
+        });
+        await telegram.sendDocument(chatId, pdfBuffer, `answers_${Date.now()}.pdf`, {
+          caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"`,
+        });
+        pdfSent = true;
+      } catch (pdfErr) {
+        console.error('PDF generation/send failed:', pdfErr);
+        await telegram.sendMessage(chatId, '⚠️ حصل خطأ أثناء تجهيز ملف الـ PDF، بس الإجابات وصلتك كنص لو كان مطلوب.');
+        if (!wantsText) {
+          // PDF was the only requested format and it failed — make sure
+          // the user isn't left with nothing.
+          await telegram.sendLongMessage(chatId, formatResults(results));
+        }
+      }
+    }
 
     // A question counts as "successfully answered" when Gemini matched
     // it to real book content (page !== null) and it wasn't a transient
@@ -232,10 +307,12 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
     const total = results.length;
     const success = results.filter((r) => !r.isError && r.page !== null).length;
 
+    const formatLine = `📨 <b>صيغة الاستلام:</b> ${FORMAT_LABELS[format]}${wantsPdf && !pdfSent ? ' (⚠️ فشل إرسال الـ PDF)' : ''}`;
     const reportLines = [
       `📊 <b>تقرير معالجة أسئلة</b>`,
       `👤 ${userLabel}`,
       `📖 ${escapeHtml(book.name)}`,
+      formatLine,
       `✅ <b>${success}/${total}</b> سؤال اتجاوب عليه من الكتاب.`,
       ...buildUsageReportLines(usage),
     ];
@@ -556,7 +633,10 @@ async function handleAdminHelp(chatId) {
     `• <code>/removeblock ID</code> — حذف فترة بكتابة رقمها يدوي (الرقم من /blocklist)، لسه شغالة لو حبيت.\n\n` +
     `🔑 <b>مفاتيح API الخاصة بالمستخدمين:</b>\n` +
     `• <code>/mykeys</code>, <code>/addkey</code>, <code>/removekey</code> — تعمل للأدمن أيضاً على مفاتيحه.\n` +
-    ` مفتاحين أو أكتر يمنحوا المستخدم أولوية إضافية في حصة Gemini اليومية.`;
+    ` مفتاحين أو أكتر يمنحوا المستخدم أولوية إضافية في حصة Gemini اليومية.\n\n` +
+    `📝📄 <b>صيغة استلام الإجابات:</b>\n` +
+    `• كل ما مستخدم يبعت سؤال أو أسئلة، البوت بيسأله بأزرار: نص، PDF منسّق زي الكتاب، أو الاثنين — لكل دفعة أسئلة على حدة (مفيش تفضيل ثابت محفوظ).\n` +
+    `• بتلاقي الصيغة اللي اختارها مذكورة في تقرير كل دفعة أسئلة بيوصلك.`;
   await telegram.sendMessage(chatId, helpMsg, { parse_mode: 'HTML' });
 }
 
@@ -1459,6 +1539,47 @@ async function handleCallbackQuery(cb) {
     }
   }
 
+  // 📝📄 Per-batch format choice — data is "ansfmt_<format>_<token>".
+  // token ties this button press back to the specific batch that was
+  // staged when the buttons were shown (see pendingBatches.stageBatch),
+  // so an old prompt from an earlier batch can't accidentally get
+  // actioned against a newer one, and a batch can only be answered once.
+  if (data.startsWith('ansfmt_')) {
+    const rest = data.slice('ansfmt_'.length);
+    const sepIdx = rest.indexOf('_');
+    const format = sepIdx === -1 ? rest : rest.slice(0, sepIdx);
+    const token = sepIdx === -1 ? '' : rest.slice(sepIdx + 1);
+
+    if (!VALID_ANSWER_FORMATS.includes(format)) {
+      await telegram.answerCallbackQuery(cb.id);
+      return;
+    }
+
+    const pending = await pendingBatches.takeBatch(userId, token);
+    if (!pending) {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    const book = await books.getBook(pending.bookId);
+    if (!book || book.status !== 'ready') {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ الكتاب ده مبقاش متاح. ابعت الأسئلة تاني.',
+        show_alert: true,
+      });
+      await telegram.editMessageText(chatId, messageId, '⚠️ الكتاب ده مبقاش متاح. ابعت الأسئلة تاني.');
+      return;
+    }
+
+    await telegram.answerCallbackQuery(cb.id, { text: `✅ ${FORMAT_LABELS[format]}` });
+    await telegram.editMessageText(chatId, messageId, `⏳ تمام، جاري تجهيز الإجابة بصيغة: ${FORMAT_LABELS[format]}...`);
+    await processBatchWithFormat(chatId, pending.questions, book, cb.from, format);
+    return;
+  }
+
   if (data.startsWith('cmd_selectbook_')) {
     const bookId = Number(data.replace('cmd_selectbook_', ''));
     const book = await books.getBook(bookId);
@@ -1718,6 +1839,7 @@ module.exports = async (req, res) => {
           `مرحباً بك ${fromUser.first_name}! 👋\n\n` +
             `ابعتلي سؤال أو أكتر (سؤال في كل سطر)، أو ملف PDF/TXT فيه أسئلة، وهدور عليهم في الكتاب.\n\n` +
             `📚 لو فيه أكتر من كتاب متاح، اختار اللي عايزه عبر /mybook.\n\n` +
+            `📝📄 كل ما تبعت سؤال أو أسئلة، هسألك عايز تستلم الإجابة إزاي: نص، ملف PDF منسّق، أو الاثنين.\n\n` +
             `🔑 عايز أولوية إضافية في حصة الاستخدام اليومية؟ أضف مفتاح Gemini API الخاص بك (مجاني) عبر /addkey.`;
         await telegram.sendMessage(chatId, welcomeText);
         await users.checkAndSendAlert(chatId, fromUser, telegram.sendMessage);
