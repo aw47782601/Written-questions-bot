@@ -72,19 +72,23 @@ function bookNameFromFileName(fileName) {
 }
 
 // =========================================================
-// 📝📄 Per-batch answer format — every time a user sends questions,
-// they're asked (via inline buttons) whether they want the answers as
-// plain Telegram text, a generated PDF styled like the reference book
-// (see lib/pdfGenerator.js / lib/pdfDesigns.js), or both. Nothing is
-// persisted across batches — this replaces the old /format command +
-// standing users.answer_format preference (see lib/users.js and
-// migrations/add_answer_format.sql for the history).
+// 📝📄🎨 Per-batch answer format + PDF color — every time a user sends
+// questions, they're asked (via inline buttons) whether they want the
+// answers as plain Telegram text, a generated PDF styled like the
+// reference book (see lib/pdfGenerator.js / lib/pdfDesigns.js), or both.
+// If they picked pdf/both, they're then asked (also via inline buttons,
+// every single time) which main color they want THAT PDF in. Nothing is
+// persisted across batches — this replaces both the old /format command
+// (standing users.answer_format preference) and the old /pdfcolor command
+// (standing users.pdf_color preference). See lib/users.js for the history
+// of both.
 //
-// The PDF/Both buttons are hidden entirely for a user the admin has
-// blocked from the PDF feature (see lib/pdfAccess.js, /pdfaccess), so
-// they're never even offered the option; the ansfmt_ callback below
-// re-checks access before actually generating anything, in case access
-// was revoked between the buttons being shown and tapped.
+// The PDF/Both buttons are hidden entirely for a user the admin hasn't
+// given access to ANY PDF design (see lib/pdfAccess.js + the button-driven
+// "🎨 صلاحيات تصاميم الـ PDF" admin panel below), so they're never even
+// offered the option; the ansfmt_ callback re-checks access before moving
+// on to the color step, in case access was revoked between the buttons
+// being shown and tapped.
 // =========================================================
 
 const FORMAT_LABELS = {
@@ -98,6 +102,26 @@ function buildFormatKeyboard(token, pdfAllowed) {
   const values = pdfAllowed ? VALID_ANSWER_FORMATS : ['text'];
   const buttons = values.map((value) => [{ text: FORMAT_LABELS[value], callback_data: `ansfmt_${value}_${token}` }]);
   return { inline_keyboard: buttons };
+}
+
+// Shown after the user picks pdf/both, so they choose a color for THIS
+// PDF only (nothing persisted — see the block comment above).
+function buildColorKeyboard(token) {
+  const buttons = pdfColors.listPdfColors().map((c) => [
+    { text: `${c.emoji} ${c.label}`, callback_data: `ansclr_${c.key}_${token}` },
+  ]);
+  return { inline_keyboard: buttons };
+}
+
+// Picks which registered design (lib/pdfDesigns.js) to render a user's PDF
+// with, out of the ones the admin currently allows them to use. There's
+// only one design today, so this is just a passthrough, but it's written
+// against the full registry so adding a second design later doesn't
+// require touching this call site — it'll just pick the first one this
+// particular user has access to.
+async function resolveDesignForUser(userId) {
+  const accessible = await pdfAccess.getAccessibleDesigns(userId, isAdmin);
+  return accessible.length > 0 ? accessible[0].id : null;
 }
 
 // Called only when the admin explicitly started the "➕ إضافة كتاب جديد"
@@ -246,7 +270,7 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
   }
 
   const token = await pendingBatches.stageBatch(fromUser.id, { questions, bookId: book.id });
-  const pdfAllowed = await pdfAccess.isPdfAllowed(fromUser.id, isAdmin);
+  const pdfAllowed = (await pdfAccess.getAccessibleDesigns(fromUser.id, isAdmin)).length > 0;
   const countLine =
     questions.length > 1
       ? `🔎 استلمت ${questions.length} سؤال من "${book.name}".`
@@ -257,10 +281,11 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
 }
 
 // Does the actual Gemini answering + delivery in the chosen format, plus
-// the admin usage report. Called once the user has picked a format for
-// this specific batch (or immediately, for the fromUser === null edge
-// case — see handleQuestionsBatch).
-async function processBatchWithFormat(chatId, questions, book, fromUser, format) {
+// the admin usage report. Called once the user has picked a format (and,
+// if it includes PDF, a design + color) for this specific batch — or
+// immediately with the defaults, for the fromUser === null edge case (see
+// handleQuestionsBatch).
+async function processBatchWithFormat(chatId, questions, book, fromUser, format, designId, colorKey) {
   const userLabel = fromUser
     ? `${escapeHtml(fromUser.first_name || '')}${fromUser.username ? ' (@' + escapeHtml(fromUser.username) + ')' : ''} — <code>${fromUser.id}</code>`
     : `<code>${chatId}</code>`;
@@ -288,20 +313,20 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format)
     }
     let pdfSent = false;
     if (wantsPdf) {
-      const pdfAllowed = fromUser ? await pdfAccess.isPdfAllowed(fromUser.id, isAdmin) : true;
+      const effectiveDesignId = designId || pdfDesigns.DEFAULT_DESIGN_ID;
+      const pdfAllowed = fromUser ? await pdfAccess.isDesignAllowed(effectiveDesignId, fromUser.id, isAdmin) : true;
       if (!pdfAllowed) {
-        // Access was revoked between the format buttons being shown and
-        // this batch actually running — fall back to text so the user
-        // isn't left with nothing.
+        // Access was revoked between the design/color buttons being shown
+        // and this batch actually running — fall back to text so the
+        // user isn't left with nothing.
         await telegram.sendMessage(chatId, '⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.');
         if (!wantsText) await telegram.sendLongMessage(chatId, formatResults(results));
       } else {
         try {
-          const colorKey = fromUser ? await users.getUserPdfColor(fromUser.id) : pdfColors.DEFAULT_PDF_COLOR;
-          const pdfBuffer = await pdfDesigns.renderPdf(pdfDesigns.DEFAULT_DESIGN_ID, results, {
+          const pdfBuffer = await pdfDesigns.renderPdf(effectiveDesignId, results, {
             title: 'Question Answers',
             bookName: book.name,
-            colorKey,
+            colorKey: colorKey || pdfColors.DEFAULT_PDF_COLOR,
           });
           await telegram.sendDocument(chatId, pdfBuffer, `answers_${Date.now()}.pdf`, {
             caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"`,
@@ -567,22 +592,6 @@ async function handleMyBookCommand(chatId, userId) {
   });
 }
 
-// 🎨 /pdfcolor — lets a user pick the PDF design's main accent color from
-// lib/pdfColors.js's presets. Persisted on users.pdf_color (see
-// lib/users.js); applied the next time they receive a PDF answer sheet.
-async function handlePdfColorCommand(chatId, userId) {
-  const current = (await users.getUserPdfColor(userId)) || pdfColors.DEFAULT_PDF_COLOR;
-  const buttons = pdfColors.listPdfColors().map((c) => [
-    {
-      text: `${c.emoji} ${c.label}${c.key === current ? ' ✅' : ''}`,
-      callback_data: `pdfcolor_${c.key}`,
-    },
-  ]);
-  await telegram.sendMessage(chatId, '🎨 اختار اللون الأساسي لتصميم ملف الـ PDF:', {
-    reply_markup: { inline_keyboard: buttons },
-  });
-}
-
 // DIAGNOSTIC (admin only): /search <كلمة> — raw text search on book_chunks,
 // bypassing embeddings entirely. Confirms whether content actually made
 // it into the DB, independent of the retrieval/embedding pipeline.
@@ -660,11 +669,9 @@ async function handleAdminHelp(chatId) {
     `• <code>/repairoff</code> — إيقاف الصيانة.\n\n` +
     `🚫 <b>حظر المستخدمين:</b>\n` +
     `• <code>/ban USER_ID</code>, <code>/unban USER_ID</code>, <code>/banlist</code>\n\n` +
-    `📄 <b>إتاحة صيغة الـ PDF:</b>\n` +
-    `• <code>/pdfaccess</code> — عرض الوضع الحالي والقايمة.\n` +
-    `• <code>/pdfaccess all</code> — إتاحة صيغة الـ PDF لكل المستخدمين (الافتراضي).\n` +
-    `• <code>/pdfaccess restricted</code> — تقييدها على الأدمن + مستخدمين محددين بس.\n` +
-    `• <code>/pdfallow USER_ID</code>, <code>/pdfdisallow USER_ID</code> — إضافة/إزالة مستخدم من القايمة (بتفضل موجودة حتى لو الوضع \"all\").\n\n` +
+    `🎨 <b>صلاحيات تصاميم الـ PDF:</b>\n` +
+    `• <code>/pdfaccess</code> — يفتح لوحة أزرار: قايمة كل تصاميم الـ PDF المسجّلة، ادوس على أي تصميم عشان تشوف/تغيّر وضعه (متاح للكل ⇄ مقيّد على مجموعة)، ولو مقيّد تقدر تضيف/تشيل مستخدمين من مجموعته بالأزرار (بتكتب الـ USER_ID لما يتطلب منك ده بس).\n` +
+    `• الوضع الافتراضي لأي تصميم جديد هو \"متاح للكل\".\n\n` +
     `⏳ <b>فترات إغلاق مجدولة (زي الامتحانات):</b>\n` +
     `• <code>/addblock</code> — يفتح لك تقويم وأزرار لاختيار تاريخ ووقت البداية والنهاية (12 ساعة + صباحاً/مساءً)، من غير ما تكتب حاجة يدوي. يقفل البوت لكل حد غير الأدمن في الفترة دي (بتوقيت القاهرة).\n` +
     `• <code>/addblock 2026-06-01 08:00 AM | 2026-06-15 08:00 PM | امتحانات نصف العام</code> — طريقة الكتابة اليدوية القديمة لسه شغالة لو حبيت (بتقبل صباحاً/مساءً أو نظام الـ24 ساعة، السبب اختياري).\n` +
@@ -674,10 +681,11 @@ async function handleAdminHelp(chatId) {
     `🔑 <b>مفاتيح API الخاصة بالمستخدمين:</b>\n` +
     `• <code>/mykeys</code>, <code>/addkey</code>, <code>/removekey</code> — تعمل للأدمن أيضاً على مفاتيحه.\n` +
     ` مفتاحين أو أكتر يمنحوا المستخدم أولوية إضافية في حصة Gemini اليومية.\n\n` +
-    `📝📄 <b>صيغة استلام الإجابات:</b>\n` +
+    `📝📄🎨 <b>صيغة استلام الإجابات ولون الـ PDF:</b>\n` +
     `• كل ما مستخدم يبعت سؤال أو أسئلة، البوت بيسأله بأزرار: نص، PDF منسّق زي الكتاب، أو الاثنين — لكل دفعة أسئلة على حدة (مفيش تفضيل ثابت محفوظ).\n` +
-    `• بتلاقي الصيغة اللي اختارها مذكورة في تقرير كل دفعة أسئلة بيوصلك.\n` +
-    `• أي مستخدم يقدر يغيّر اللون الأساسي لتصميم الـ PDF بتاعه عبر <code>/pdfcolor</code>.`;
+    `• لو اختار PDF أو الاثنين، هيتسأل بعدها بأزرار كمان يعايز أي لون أساسي للـ PDF ده تحديداً — في كل مرة من جديد (مفيش لون ثابت محفوظ).\n` +
+    `• زر الـ PDF أصلاً بيظهر بس لو المستخدم عنده صلاحية لتصميم PDF واحد على الأقل (شوف \"صلاحيات تصاميم الـ PDF\" فوق).\n` +
+    `• بتلاقي الصيغة اللي اختارها مذكورة في تقرير كل دفعة أسئلة بيوصلك.`;
   await telegram.sendMessage(chatId, helpMsg, { parse_mode: 'HTML' });
 }
 
@@ -855,67 +863,150 @@ async function handleBanList(chatId) {
 }
 
 // =========================================================
-// 📄 PDF access control — admin decides whether the PDF answer format is
-// available to everyone or only to an admin-managed whitelist of user
-// ids. See lib/pdfAccess.js.
+// 🎨 PDF design access control — fully button-driven admin panel. For
+// EACH registered PDF design (see lib/pdfDesigns.js) the admin can toggle
+// it between "available to everyone" and "restricted to a group", and
+// manage that group (add/remove by user id) — all via inline buttons.
+// The only typing involved is pasting a USER_ID when adding someone to a
+// group, exactly like the existing book-rename button flow (see
+// tryHandleBookRenamePaste) — there's no way to pick an arbitrary
+// Telegram user id from a button, so that one step stays text-based.
+// See lib/pdfAccess.js for the underlying per-design storage.
 // =========================================================
 
-async function handlePdfAccessStatus(chatId) {
-  const mode = await pdfAccess.getAccessMode();
-  const ids = await pdfAccess.getWhitelist();
+// Top-level screen: one button per registered design. Reached via
+// /pdfaccess or the 'pda_back' callback.
+async function buildPdfAccessOverview() {
+  const designs = pdfDesigns.listDesigns();
+  const buttons = designs.map((d) => [{ text: `🎨 ${d.label}`, callback_data: `pda_design_${d.id}` }]);
+  return {
+    text: `🎨 <b>صلاحيات تصاميم الـ PDF</b>\n\nاختار تصميم عشان تشوف/تغيّر وضعه:`,
+    reply_markup: { inline_keyboard: buttons },
+  };
+}
+
+async function handlePdfAccessPanel(chatId) {
+  const { text, reply_markup } = await buildPdfAccessOverview();
+  await telegram.sendMessage(chatId, text, { parse_mode: 'HTML', reply_markup });
+}
+
+async function handlePdfAccessBackButton(chatId, messageId) {
+  const { text, reply_markup } = await buildPdfAccessOverview();
+  await telegram.editMessageText(chatId, messageId, text, { parse_mode: 'HTML', reply_markup });
+}
+
+// Per-design menu: current mode + toggle + manage-group + back.
+async function handlePdfDesignMenu(chatId, messageId, designId) {
+  const design = pdfDesigns.DESIGNS[designId];
+  if (!design) {
+    await telegram.editMessageText(chatId, messageId, '❌ التصميم ده مش موجود.');
+    return;
+  }
+  const mode = await pdfAccess.getAccessMode(designId);
+  const ids = await pdfAccess.getWhitelist(designId);
   const modeLine =
     mode === 'all'
-      ? '✅ متاحة لكل المستخدمين.'
-      : `🔒 مقيدة — متاحة بس للأدمن + ${ids.length} مستخدم في القايمة.`;
-  const listLine = ids.length > 0 ? `\n\nالقايمة الحالية:\n${ids.map((id, i) => `${i + 1}. <code>${id}</code>`).join('\n')}` : '';
-  await telegram.sendMessage(
-    chatId,
-    `📄 <b>وضع إتاحة الـ PDF:</b>\n${modeLine}${listLine}\n\n` +
-      `استخدم:\n<code>/pdfaccess all</code> — إتاحة للكل\n<code>/pdfaccess restricted</code> — تقييد للقايمة فقط\n` +
-      `<code>/pdfallow USER_ID</code> — إضافة للقايمة\n<code>/pdfdisallow USER_ID</code> — إزالة من القايمة`,
-    { parse_mode: 'HTML' }
-  );
+      ? '✅ متاح لكل المستخدمين حالياً.'
+      : `🔒 مقيّد حالياً — متاح بس للأدمن + ${ids.length} مستخدم في مجموعته.`;
+  const text = `🎨 <b>${design.label}</b>\n\n${modeLine}\n\nاختار إجراء:`;
+  await telegram.editMessageText(chatId, messageId, text, {
+    parse_mode: 'HTML',
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: mode === 'all' ? '🔒 قيّد على مجموعة محددة' : '✅ إتاحة للكل',
+            callback_data: `pda_togglemode_${designId}`,
+          },
+        ],
+        [{ text: `👥 إدارة المجموعة (${ids.length})`, callback_data: `pda_managelist_${designId}` }],
+        [{ text: '🔙 رجوع', callback_data: 'pda_back' }],
+      ],
+    },
+  });
 }
 
-async function handlePdfAccessSetMode(chatId, modeArg) {
-  const mode = modeArg.trim().toLowerCase();
-  if (mode !== 'all' && mode !== 'restricted') {
-    await telegram.sendMessage(chatId, '⚠️ استخدم: <code>/pdfaccess all</code> أو <code>/pdfaccess restricted</code>', {
+async function handlePdfToggleMode(chatId, messageId, designId) {
+  const current = await pdfAccess.getAccessMode(designId);
+  await pdfAccess.setAccessMode(designId, current === 'all' ? 'whitelist' : 'all');
+  await handlePdfDesignMenu(chatId, messageId, designId);
+}
+
+// Whitelist management screen: every user in the group gets a ❌ button
+// to remove them directly, plus an "add" button and a back button. The
+// group is kept (and stays editable) even while mode is "all", so
+// switching a design back to "restricted" later doesn't lose it.
+async function handlePdfManageList(chatId, messageId, designId) {
+  const design = pdfDesigns.DESIGNS[designId];
+  if (!design) {
+    await telegram.editMessageText(chatId, messageId, '❌ التصميم ده مش موجود.');
+    return;
+  }
+  const ids = await pdfAccess.getWhitelist(designId);
+  const listLine = ids.length > 0 ? '' : '\n\n📭 المجموعة فاضية حالياً.';
+  const removeButtons = ids.map((id) => [{ text: `❌ ${id}`, callback_data: `pda_removeuser_${designId}_${id}` }]);
+  await telegram.editMessageText(
+    chatId,
+    messageId,
+    `👥 <b>مجموعة "${design.label}"</b>${listLine}`,
+    {
       parse_mode: 'HTML',
-    });
-    return;
-  }
-  await pdfAccess.setAccessMode(mode === 'restricted' ? 'whitelist' : 'all');
-  await telegram.sendMessage(
-    chatId,
-    mode === 'all'
-      ? '✅ صيغة الـ PDF بقت متاحة لكل المستخدمين.'
-      : '🔒 صيغة الـ PDF بقت مقيدة — متاحة بس للأدمن والمستخدمين في القايمة (عبر /pdfallow).'
+      reply_markup: {
+        inline_keyboard: [
+          ...removeButtons,
+          [{ text: '➕ إضافة مستخدم', callback_data: `pda_adduser_${designId}` }],
+          [{ text: '🔙 رجوع', callback_data: `pda_design_${designId}` }],
+        ],
+      },
+    }
   );
 }
 
-async function handlePdfAllow(chatId, targetId) {
-  if (!targetId || !/^\d+$/.test(targetId)) {
-    await telegram.sendMessage(chatId, '⚠️ استخدم: <code>/pdfallow USER_ID</code>', { parse_mode: 'HTML' });
-    return;
-  }
-  await pdfAccess.addToWhitelist(targetId);
-  await telegram.sendMessage(chatId, `✅ المستخدم <code>${targetId}</code> بقى معاه إتاحة لصيغة الـ PDF.`, { parse_mode: 'HTML' });
+async function handlePdfRemoveUser(chatId, messageId, designId, targetId) {
+  await pdfAccess.removeFromWhitelist(designId, targetId);
+  await handlePdfManageList(chatId, messageId, designId);
 }
 
-async function handlePdfDisallow(chatId, targetId) {
-  if (!targetId || !/^\d+$/.test(targetId)) {
-    await telegram.sendMessage(chatId, '⚠️ استخدم: <code>/pdfdisallow USER_ID</code>', { parse_mode: 'HTML' });
+// Puts the admin into "waiting to type a USER_ID to add" mode for this
+// design (button-driven equivalent of the old /pdfallow USER_ID).
+async function handlePdfAddUserPrompt(chatId, messageId, adminId, designId) {
+  const design = pdfDesigns.DESIGNS[designId];
+  if (!design) {
+    await telegram.editMessageText(chatId, messageId, '❌ التصميم ده مش موجود.');
     return;
   }
-  const removed = await pdfAccess.removeFromWhitelist(targetId);
-  await telegram.sendMessage(
+  await botConfig.setConfig(`pdfadduser_${adminId}`, { designId });
+  await telegram.editMessageText(
     chatId,
-    removed
-      ? `✅ تم إزالة المستخدم <code>${targetId}</code> من قايمة إتاحة الـ PDF.`
-      : `⚠️ المستخدم <code>${targetId}</code> مش موجود في القايمة أصلاً.`,
-    { parse_mode: 'HTML' }
+    messageId,
+    `➕ ابعت الآن USER_ID المستخدم اللي عايز تضيفه لمجموعة "${design.label}" كرسالة نصية.`,
+    { reply_markup: { inline_keyboard: [[{ text: '❌ إلغاء', callback_data: `pda_managelist_${designId}` }]] } }
   );
+}
+
+// Called when a plain-text message arrives while the admin is in
+// "waiting to type a USER_ID to add" mode (set by handlePdfAddUserPrompt).
+// Returns true if it handled the message.
+async function tryHandlePdfAddUserPaste(chatId, adminId, text) {
+  const state = await botConfig.getConfig(`pdfadduser_${adminId}`);
+  if (!state || !state.designId) return false;
+
+  await botConfig.deleteConfig(`pdfadduser_${adminId}`);
+  const targetId = text.trim();
+  const design = pdfDesigns.DESIGNS[state.designId];
+  if (!design) {
+    await telegram.sendMessage(chatId, '❌ التصميم ده مبقاش موجود.');
+    return true;
+  }
+  if (!/^\d+$/.test(targetId)) {
+    await telegram.sendMessage(chatId, '⚠️ ده مش USER_ID صحيح (لازم يكون رقم). اتلغت العملية، استخدم /pdfaccess تاني لو عايز تحاول.');
+    return true;
+  }
+  await pdfAccess.addToWhitelist(state.designId, targetId);
+  await telegram.sendMessage(chatId, `✅ المستخدم <code>${targetId}</code> بقى معاه إتاحة لتصميم "${design.label}".`, {
+    parse_mode: 'HTML',
+  });
+  return true;
 }
 
 // =========================================================
@@ -1649,6 +1740,9 @@ async function handleCallbackQuery(cb) {
   // staged when the buttons were shown (see pendingBatches.stageBatch),
   // so an old prompt from an earlier batch can't accidentally get
   // actioned against a newer one, and a batch can only be answered once.
+  // 'text' answers immediately (consuming the batch); 'pdf'/'both' go on
+  // to a color-picker step instead (see ansclr_ below) — the batch stays
+  // staged (via pendingBatches.updateBatch, not takeBatch) until then.
   if (data.startsWith('ansfmt_')) {
     const rest = data.slice('ansfmt_'.length);
     const sepIdx = rest.indexOf('_');
@@ -1660,14 +1754,33 @@ async function handleCallbackQuery(cb) {
       return;
     }
 
-    if ((format === 'pdf' || format === 'both') && !(await pdfAccess.isPdfAllowed(userId, isAdmin))) {
-      await telegram.answerCallbackQuery(cb.id, {
-        text: '⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.',
-        show_alert: true,
+    if (format === 'pdf' || format === 'both') {
+      const accessible = await pdfAccess.getAccessibleDesigns(userId, isAdmin);
+      if (accessible.length === 0) {
+        await telegram.answerCallbackQuery(cb.id, {
+          text: '⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.',
+          show_alert: true,
+        });
+        return;
+      }
+
+      const updated = await pendingBatches.updateBatch(userId, token, { format });
+      if (!updated) {
+        await telegram.answerCallbackQuery(cb.id, {
+          text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
+          show_alert: true,
+        });
+        return;
+      }
+
+      await telegram.answerCallbackQuery(cb.id, { text: `✅ ${FORMAT_LABELS[format]}` });
+      await telegram.editMessageText(chatId, messageId, `🎨 اختار اللون الأساسي لملف الـ PDF ده:`, {
+        reply_markup: buildColorKeyboard(token),
       });
       return;
     }
 
+    // format === 'text' — answer right away, no design/color needed.
     const pending = await pendingBatches.takeBatch(userId, token);
     if (!pending) {
       await telegram.answerCallbackQuery(cb.id, {
@@ -1693,6 +1806,61 @@ async function handleCallbackQuery(cb) {
     return;
   }
 
+  // 🎨 Per-batch PDF color choice — data is "ansclr_<colorKey>_<token>".
+  // Final step after ansfmt_ picked pdf/both: picks which registered
+  // design the user currently has access to (see resolveDesignForUser),
+  // consumes the batch, and answers. Nothing here is persisted — the
+  // next batch asks again from scratch.
+  if (data.startsWith('ansclr_')) {
+    const rest = data.slice('ansclr_'.length);
+    const sepIdx = rest.indexOf('_');
+    const colorKey = sepIdx === -1 ? rest : rest.slice(0, sepIdx);
+    const token = sepIdx === -1 ? '' : rest.slice(sepIdx + 1);
+
+    if (!pdfColors.isValidPdfColor(colorKey)) {
+      await telegram.answerCallbackQuery(cb.id);
+      return;
+    }
+
+    const designId = await resolveDesignForUser(userId);
+    if (!designId) {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    const pending = await pendingBatches.takeBatch(userId, token);
+    if (!pending || !pending.format) {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    const book = await books.getBook(pending.bookId);
+    if (!book || book.status !== 'ready') {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ الكتاب ده مبقاش متاح. ابعت الأسئلة تاني.',
+        show_alert: true,
+      });
+      await telegram.editMessageText(chatId, messageId, '⚠️ الكتاب ده مبقاش متاح. ابعت الأسئلة تاني.');
+      return;
+    }
+
+    const preset = pdfColors.PDF_COLOR_PRESETS[colorKey];
+    await telegram.answerCallbackQuery(cb.id, { text: `✅ ${preset.emoji} ${preset.label}` });
+    await telegram.editMessageText(
+      chatId,
+      messageId,
+      `⏳ تمام، جاري تجهيز الإجابة بصيغة: ${FORMAT_LABELS[pending.format]} (${preset.emoji} ${preset.label})...`
+    );
+    await processBatchWithFormat(chatId, pending.questions, book, cb.from, pending.format, designId, colorKey);
+    return;
+  }
+
   if (data.startsWith('cmd_selectbook_')) {
     const bookId = Number(data.replace('cmd_selectbook_', ''));
     const book = await books.getBook(bookId);
@@ -1706,21 +1874,56 @@ async function handleCallbackQuery(cb) {
     return;
   }
 
-  // 🎨 /pdfcolor picker — data is "pdfcolor_<key>".
-  if (data.startsWith('pdfcolor_')) {
-    const colorKey = data.slice('pdfcolor_'.length);
-    if (!pdfColors.isValidPdfColor(colorKey)) {
+  // 🎨 Admin PDF-design-access panel — all data starts with "pda_"
+  // (admin-only; silently ack for anyone else, same as the book-management
+  // buttons above, since these callback_data values only ever get sent to
+  // admins in the first place).
+  if (data.startsWith('pda_')) {
+    if (!isAdmin(userId)) {
       await telegram.answerCallbackQuery(cb.id);
       return;
     }
-    await users.setUserPdfColor(userId, colorKey);
-    const preset = pdfColors.PDF_COLOR_PRESETS[colorKey];
-    await telegram.answerCallbackQuery(cb.id, { text: `✅ ${preset.emoji} ${preset.label}` });
-    await telegram.editMessageText(
-      chatId,
-      messageId,
-      `🎨 تم اختيار ${preset.emoji} *${preset.label}* كلون أساسي لملفات الـ PDF.\n\nممكن تغيّره في أي وقت عبر /pdfcolor.`
-    );
+
+    if (data === 'pda_back') {
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfAccessBackButton(chatId, messageId);
+      return;
+    }
+    if (data.startsWith('pda_design_')) {
+      const designId = data.replace('pda_design_', '');
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfDesignMenu(chatId, messageId, designId);
+      return;
+    }
+    if (data.startsWith('pda_togglemode_')) {
+      const designId = data.replace('pda_togglemode_', '');
+      await telegram.answerCallbackQuery(cb.id, { text: '✅ تم التحديث.' });
+      await handlePdfToggleMode(chatId, messageId, designId);
+      return;
+    }
+    if (data.startsWith('pda_managelist_')) {
+      const designId = data.replace('pda_managelist_', '');
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfManageList(chatId, messageId, designId);
+      return;
+    }
+    if (data.startsWith('pda_removeuser_')) {
+      const rest = data.replace('pda_removeuser_', ''); // "<designId>_<userId>"
+      const sepIdx = rest.lastIndexOf('_');
+      const designId = rest.slice(0, sepIdx);
+      const targetId = rest.slice(sepIdx + 1);
+      await telegram.answerCallbackQuery(cb.id, { text: '✅ تم الحذف.' });
+      await handlePdfRemoveUser(chatId, messageId, designId, targetId);
+      return;
+    }
+    if (data.startsWith('pda_adduser_')) {
+      const designId = data.replace('pda_adduser_', '');
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfAddUserPrompt(chatId, messageId, userId, designId);
+      return;
+    }
+
+    await telegram.answerCallbackQuery(cb.id);
     return;
   }
 
@@ -1810,20 +2013,11 @@ async function tryHandleAdminCommand(chatId, adminId, text) {
     await handleBanList(chatId);
     return true;
   }
-  if (text === '/pdfaccess') {
-    await handlePdfAccessStatus(chatId);
-    return true;
-  }
-  if (text.startsWith('/pdfaccess ')) {
-    await handlePdfAccessSetMode(chatId, text.replace('/pdfaccess ', ''));
-    return true;
-  }
-  if (text.startsWith('/pdfallow ')) {
-    await handlePdfAllow(chatId, text.replace('/pdfallow ', '').trim());
-    return true;
-  }
-  if (text.startsWith('/pdfdisallow ')) {
-    await handlePdfDisallow(chatId, text.replace('/pdfdisallow ', '').trim());
+  if (text === '/pdfaccess' || text.startsWith('/pdfaccess ')) {
+    // Everything used to be a typed sub-command (/pdfaccess all,
+    // /pdfallow USER_ID, ...) — now it's all buttons, so /pdfaccess just
+    // opens the panel regardless of any trailing text.
+    await handlePdfAccessPanel(chatId);
     return true;
   }
   if (text.startsWith('/addblock ')) {
@@ -1986,8 +2180,7 @@ module.exports = async (req, res) => {
           `مرحباً بك ${fromUser.first_name}! 👋\n\n` +
             `ابعتلي سؤال أو أكتر (سؤال في كل سطر)، أو ملف PDF/TXT فيه أسئلة، وهدور عليهم في الكتاب.\n\n` +
             `📚 لو فيه أكتر من كتاب متاح، اختار اللي عايزه عبر /mybook.\n\n` +
-            `📝📄 كل ما تبعت سؤال أو أسئلة، هسألك عايز تستلم الإجابة إزاي: نص، ملف PDF منسّق، أو الاثنين.\n\n` +
-            `🎨 عايز تغيّر اللون الأساسي لتصميم ملف الـ PDF؟ جرّب /pdfcolor.\n\n` +
+            `📝📄🎨 كل ما تبعت سؤال أو أسئلة، هسألك عايز تستلم الإجابة إزاي: نص، ملف PDF منسّق، أو الاثنين — ولو اخترت PDF هسألك كمان تعايز أي لون ليه، في كل مرة.\n\n` +
             `🔑 عايز أولوية إضافية في حصة الاستخدام اليومية؟ أضف مفتاح Gemini API الخاص بك (مجاني) عبر /addkey.`;
         await telegram.sendMessage(chatId, welcomeText);
         await users.checkAndSendAlert(chatId, fromUser, telegram.sendMessage);
@@ -1999,8 +2192,6 @@ module.exports = async (req, res) => {
         await handleDebugCommand(chatId, text.slice('/debug '.length).trim());
       } else if (text.startsWith('/mybook')) {
         await handleMyBookCommand(chatId, fromUser.id);
-      } else if (text.startsWith('/pdfcolor')) {
-        await handlePdfColorCommand(chatId, fromUser.id);
       } else if (text.startsWith('/addkey')) {
         await handleAddKeyStart(chatId, fromUser.id);
       } else if (text.startsWith('/mykeys')) {
@@ -2026,17 +2217,26 @@ module.exports = async (req, res) => {
           !handledAsAddBlockMinute &&
           admin &&
           (await tryHandleAddBlockLabelPaste(chatId, fromUser.id, text));
+        const handledAsPdfAddUser =
+          !handledAsBookRename &&
+          !handledAsNewBookName &&
+          !handledAsAddBlockMinute &&
+          !handledAsAddBlockLabel &&
+          admin &&
+          (await tryHandlePdfAddUserPaste(chatId, fromUser.id, text));
         const handledAsKeyPaste =
           !handledAsBookRename &&
           !handledAsNewBookName &&
           !handledAsAddBlockMinute &&
           !handledAsAddBlockLabel &&
+          !handledAsPdfAddUser &&
           (await tryHandleAddKeyPaste(chatId, fromUser.id, text));
         if (
           !handledAsBookRename &&
           !handledAsNewBookName &&
           !handledAsAddBlockMinute &&
           !handledAsAddBlockLabel &&
+          !handledAsPdfAddUser &&
           !handledAsKeyPaste
         ) {
           const questions = extractQuestionsFromText(text).slice(0, MAX_QUESTIONS);
