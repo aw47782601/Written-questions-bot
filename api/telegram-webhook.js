@@ -10,7 +10,9 @@ const {
   extractQuestionsFromText,
 } = require('../lib/questionExtractor');
 const { answerQuestions } = require('../lib/batchAnswer');
-const { generateAnswersPdf } = require('../lib/pdfGenerator');
+const pdfDesigns = require('../lib/pdfDesigns');
+const pdfAccess = require('../lib/pdfAccess');
+const pdfColors = require('../lib/pdfColors');
 const { DailyLimitReachedError } = require('../lib/usageTracker');
 const botConfig = require('../lib/botConfig');
 const users = require('../lib/users');
@@ -73,10 +75,16 @@ function bookNameFromFileName(fileName) {
 // 📝📄 Per-batch answer format — every time a user sends questions,
 // they're asked (via inline buttons) whether they want the answers as
 // plain Telegram text, a generated PDF styled like the reference book
-// (see lib/pdfGenerator.js), or both. Nothing is persisted across
-// batches — this replaces the old /format command + standing
-// users.answer_format preference (see lib/users.js and
+// (see lib/pdfGenerator.js / lib/pdfDesigns.js), or both. Nothing is
+// persisted across batches — this replaces the old /format command +
+// standing users.answer_format preference (see lib/users.js and
 // migrations/add_answer_format.sql for the history).
+//
+// The PDF/Both buttons are hidden entirely for a user the admin has
+// blocked from the PDF feature (see lib/pdfAccess.js, /pdfaccess), so
+// they're never even offered the option; the ansfmt_ callback below
+// re-checks access before actually generating anything, in case access
+// was revoked between the buttons being shown and tapped.
 // =========================================================
 
 const FORMAT_LABELS = {
@@ -86,10 +94,9 @@ const FORMAT_LABELS = {
 };
 const VALID_ANSWER_FORMATS = Object.keys(FORMAT_LABELS);
 
-function buildFormatKeyboard(token) {
-  const buttons = Object.entries(FORMAT_LABELS).map(([value, label]) => [
-    { text: label, callback_data: `ansfmt_${value}_${token}` },
-  ]);
+function buildFormatKeyboard(token, pdfAllowed) {
+  const values = pdfAllowed ? VALID_ANSWER_FORMATS : ['text'];
+  const buttons = values.map((value) => [{ text: FORMAT_LABELS[value], callback_data: `ansfmt_${value}_${token}` }]);
   return { inline_keyboard: buttons };
 }
 
@@ -239,12 +246,13 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
   }
 
   const token = await pendingBatches.stageBatch(fromUser.id, { questions, bookId: book.id });
+  const pdfAllowed = await pdfAccess.isPdfAllowed(fromUser.id, isAdmin);
   const countLine =
     questions.length > 1
       ? `🔎 استلمت ${questions.length} سؤال من "${book.name}".`
       : `🔎 استلمت سؤالك من "${book.name}".`;
   await telegram.sendMessage(chatId, `${countLine}\n\n📝📄 عايز تستلم الإجابة/الإجابات إزاي؟`, {
-    reply_markup: buildFormatKeyboard(token),
+    reply_markup: buildFormatKeyboard(token, pdfAllowed),
   });
 }
 
@@ -280,22 +288,33 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format)
     }
     let pdfSent = false;
     if (wantsPdf) {
-      try {
-        const pdfBuffer = await generateAnswersPdf(results, {
-          title: 'Question Answers',
-          bookName: book.name,
-        });
-        await telegram.sendDocument(chatId, pdfBuffer, `answers_${Date.now()}.pdf`, {
-          caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"`,
-        });
-        pdfSent = true;
-      } catch (pdfErr) {
-        console.error('PDF generation/send failed:', pdfErr);
-        await telegram.sendMessage(chatId, '⚠️ حصل خطأ أثناء تجهيز ملف الـ PDF، بس الإجابات وصلتك كنص لو كان مطلوب.');
-        if (!wantsText) {
-          // PDF was the only requested format and it failed — make sure
-          // the user isn't left with nothing.
-          await telegram.sendLongMessage(chatId, formatResults(results));
+      const pdfAllowed = fromUser ? await pdfAccess.isPdfAllowed(fromUser.id, isAdmin) : true;
+      if (!pdfAllowed) {
+        // Access was revoked between the format buttons being shown and
+        // this batch actually running — fall back to text so the user
+        // isn't left with nothing.
+        await telegram.sendMessage(chatId, '⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.');
+        if (!wantsText) await telegram.sendLongMessage(chatId, formatResults(results));
+      } else {
+        try {
+          const colorKey = fromUser ? await users.getUserPdfColor(fromUser.id) : pdfColors.DEFAULT_PDF_COLOR;
+          const pdfBuffer = await pdfDesigns.renderPdf(pdfDesigns.DEFAULT_DESIGN_ID, results, {
+            title: 'Question Answers',
+            bookName: book.name,
+            colorKey,
+          });
+          await telegram.sendDocument(chatId, pdfBuffer, `answers_${Date.now()}.pdf`, {
+            caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"`,
+          });
+          pdfSent = true;
+        } catch (pdfErr) {
+          console.error('PDF generation/send failed:', pdfErr);
+          await telegram.sendMessage(chatId, '⚠️ حصل خطأ أثناء تجهيز ملف الـ PDF، بس الإجابات وصلتك كنص لو كان مطلوب.');
+          if (!wantsText) {
+            // PDF was the only requested format and it failed — make sure
+            // the user isn't left with nothing.
+            await telegram.sendLongMessage(chatId, formatResults(results));
+          }
         }
       }
     }
@@ -548,6 +567,22 @@ async function handleMyBookCommand(chatId, userId) {
   });
 }
 
+// 🎨 /pdfcolor — lets a user pick the PDF design's main accent color from
+// lib/pdfColors.js's presets. Persisted on users.pdf_color (see
+// lib/users.js); applied the next time they receive a PDF answer sheet.
+async function handlePdfColorCommand(chatId, userId) {
+  const current = (await users.getUserPdfColor(userId)) || pdfColors.DEFAULT_PDF_COLOR;
+  const buttons = pdfColors.listPdfColors().map((c) => [
+    {
+      text: `${c.emoji} ${c.label}${c.key === current ? ' ✅' : ''}`,
+      callback_data: `pdfcolor_${c.key}`,
+    },
+  ]);
+  await telegram.sendMessage(chatId, '🎨 اختار اللون الأساسي لتصميم ملف الـ PDF:', {
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
 // DIAGNOSTIC (admin only): /search <كلمة> — raw text search on book_chunks,
 // bypassing embeddings entirely. Confirms whether content actually made
 // it into the DB, independent of the retrieval/embedding pipeline.
@@ -625,6 +660,11 @@ async function handleAdminHelp(chatId) {
     `• <code>/repairoff</code> — إيقاف الصيانة.\n\n` +
     `🚫 <b>حظر المستخدمين:</b>\n` +
     `• <code>/ban USER_ID</code>, <code>/unban USER_ID</code>, <code>/banlist</code>\n\n` +
+    `📄 <b>إتاحة صيغة الـ PDF:</b>\n` +
+    `• <code>/pdfaccess</code> — عرض الوضع الحالي والقايمة.\n` +
+    `• <code>/pdfaccess all</code> — إتاحة صيغة الـ PDF لكل المستخدمين (الافتراضي).\n` +
+    `• <code>/pdfaccess restricted</code> — تقييدها على الأدمن + مستخدمين محددين بس.\n` +
+    `• <code>/pdfallow USER_ID</code>, <code>/pdfdisallow USER_ID</code> — إضافة/إزالة مستخدم من القايمة (بتفضل موجودة حتى لو الوضع \"all\").\n\n` +
     `⏳ <b>فترات إغلاق مجدولة (زي الامتحانات):</b>\n` +
     `• <code>/addblock</code> — يفتح لك تقويم وأزرار لاختيار تاريخ ووقت البداية والنهاية (12 ساعة + صباحاً/مساءً)، من غير ما تكتب حاجة يدوي. يقفل البوت لكل حد غير الأدمن في الفترة دي (بتوقيت القاهرة).\n` +
     `• <code>/addblock 2026-06-01 08:00 AM | 2026-06-15 08:00 PM | امتحانات نصف العام</code> — طريقة الكتابة اليدوية القديمة لسه شغالة لو حبيت (بتقبل صباحاً/مساءً أو نظام الـ24 ساعة، السبب اختياري).\n` +
@@ -636,7 +676,8 @@ async function handleAdminHelp(chatId) {
     ` مفتاحين أو أكتر يمنحوا المستخدم أولوية إضافية في حصة Gemini اليومية.\n\n` +
     `📝📄 <b>صيغة استلام الإجابات:</b>\n` +
     `• كل ما مستخدم يبعت سؤال أو أسئلة، البوت بيسأله بأزرار: نص، PDF منسّق زي الكتاب، أو الاثنين — لكل دفعة أسئلة على حدة (مفيش تفضيل ثابت محفوظ).\n` +
-    `• بتلاقي الصيغة اللي اختارها مذكورة في تقرير كل دفعة أسئلة بيوصلك.`;
+    `• بتلاقي الصيغة اللي اختارها مذكورة في تقرير كل دفعة أسئلة بيوصلك.\n` +
+    `• أي مستخدم يقدر يغيّر اللون الأساسي لتصميم الـ PDF بتاعه عبر <code>/pdfcolor</code>.`;
   await telegram.sendMessage(chatId, helpMsg, { parse_mode: 'HTML' });
 }
 
@@ -811,6 +852,70 @@ async function handleBanList(chatId) {
   }
   const list = banned.map((id, i) => `${i + 1}. <code>${id}</code>`).join('\n');
   await telegram.sendMessage(chatId, `🚫 <b>المستخدمون المحظورون (${banned.length}):</b>\n\n${list}`, { parse_mode: 'HTML' });
+}
+
+// =========================================================
+// 📄 PDF access control — admin decides whether the PDF answer format is
+// available to everyone or only to an admin-managed whitelist of user
+// ids. See lib/pdfAccess.js.
+// =========================================================
+
+async function handlePdfAccessStatus(chatId) {
+  const mode = await pdfAccess.getAccessMode();
+  const ids = await pdfAccess.getWhitelist();
+  const modeLine =
+    mode === 'all'
+      ? '✅ متاحة لكل المستخدمين.'
+      : `🔒 مقيدة — متاحة بس للأدمن + ${ids.length} مستخدم في القايمة.`;
+  const listLine = ids.length > 0 ? `\n\nالقايمة الحالية:\n${ids.map((id, i) => `${i + 1}. <code>${id}</code>`).join('\n')}` : '';
+  await telegram.sendMessage(
+    chatId,
+    `📄 <b>وضع إتاحة الـ PDF:</b>\n${modeLine}${listLine}\n\n` +
+      `استخدم:\n<code>/pdfaccess all</code> — إتاحة للكل\n<code>/pdfaccess restricted</code> — تقييد للقايمة فقط\n` +
+      `<code>/pdfallow USER_ID</code> — إضافة للقايمة\n<code>/pdfdisallow USER_ID</code> — إزالة من القايمة`,
+    { parse_mode: 'HTML' }
+  );
+}
+
+async function handlePdfAccessSetMode(chatId, modeArg) {
+  const mode = modeArg.trim().toLowerCase();
+  if (mode !== 'all' && mode !== 'restricted') {
+    await telegram.sendMessage(chatId, '⚠️ استخدم: <code>/pdfaccess all</code> أو <code>/pdfaccess restricted</code>', {
+      parse_mode: 'HTML',
+    });
+    return;
+  }
+  await pdfAccess.setAccessMode(mode === 'restricted' ? 'whitelist' : 'all');
+  await telegram.sendMessage(
+    chatId,
+    mode === 'all'
+      ? '✅ صيغة الـ PDF بقت متاحة لكل المستخدمين.'
+      : '🔒 صيغة الـ PDF بقت مقيدة — متاحة بس للأدمن والمستخدمين في القايمة (عبر /pdfallow).'
+  );
+}
+
+async function handlePdfAllow(chatId, targetId) {
+  if (!targetId || !/^\d+$/.test(targetId)) {
+    await telegram.sendMessage(chatId, '⚠️ استخدم: <code>/pdfallow USER_ID</code>', { parse_mode: 'HTML' });
+    return;
+  }
+  await pdfAccess.addToWhitelist(targetId);
+  await telegram.sendMessage(chatId, `✅ المستخدم <code>${targetId}</code> بقى معاه إتاحة لصيغة الـ PDF.`, { parse_mode: 'HTML' });
+}
+
+async function handlePdfDisallow(chatId, targetId) {
+  if (!targetId || !/^\d+$/.test(targetId)) {
+    await telegram.sendMessage(chatId, '⚠️ استخدم: <code>/pdfdisallow USER_ID</code>', { parse_mode: 'HTML' });
+    return;
+  }
+  const removed = await pdfAccess.removeFromWhitelist(targetId);
+  await telegram.sendMessage(
+    chatId,
+    removed
+      ? `✅ تم إزالة المستخدم <code>${targetId}</code> من قايمة إتاحة الـ PDF.`
+      : `⚠️ المستخدم <code>${targetId}</code> مش موجود في القايمة أصلاً.`,
+    { parse_mode: 'HTML' }
+  );
 }
 
 // =========================================================
@@ -1555,6 +1660,14 @@ async function handleCallbackQuery(cb) {
       return;
     }
 
+    if ((format === 'pdf' || format === 'both') && !(await pdfAccess.isPdfAllowed(userId, isAdmin))) {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.',
+        show_alert: true,
+      });
+      return;
+    }
+
     const pending = await pendingBatches.takeBatch(userId, token);
     if (!pending) {
       await telegram.answerCallbackQuery(cb.id, {
@@ -1590,6 +1703,24 @@ async function handleCallbackQuery(cb) {
     await users.setSelectedBookId(userId, bookId);
     await telegram.answerCallbackQuery(cb.id, { text: `✅ تم اختيار "${book.name}".` });
     await telegram.editMessageText(chatId, messageId, `📖 هتدور دلوقت في: *${book.name}*\n\nممكن تغيّره في أي وقت عبر /mybook.`);
+    return;
+  }
+
+  // 🎨 /pdfcolor picker — data is "pdfcolor_<key>".
+  if (data.startsWith('pdfcolor_')) {
+    const colorKey = data.slice('pdfcolor_'.length);
+    if (!pdfColors.isValidPdfColor(colorKey)) {
+      await telegram.answerCallbackQuery(cb.id);
+      return;
+    }
+    await users.setUserPdfColor(userId, colorKey);
+    const preset = pdfColors.PDF_COLOR_PRESETS[colorKey];
+    await telegram.answerCallbackQuery(cb.id, { text: `✅ ${preset.emoji} ${preset.label}` });
+    await telegram.editMessageText(
+      chatId,
+      messageId,
+      `🎨 تم اختيار ${preset.emoji} *${preset.label}* كلون أساسي لملفات الـ PDF.\n\nممكن تغيّره في أي وقت عبر /pdfcolor.`
+    );
     return;
   }
 
@@ -1677,6 +1808,22 @@ async function tryHandleAdminCommand(chatId, adminId, text) {
   }
   if (text === '/banlist') {
     await handleBanList(chatId);
+    return true;
+  }
+  if (text === '/pdfaccess') {
+    await handlePdfAccessStatus(chatId);
+    return true;
+  }
+  if (text.startsWith('/pdfaccess ')) {
+    await handlePdfAccessSetMode(chatId, text.replace('/pdfaccess ', ''));
+    return true;
+  }
+  if (text.startsWith('/pdfallow ')) {
+    await handlePdfAllow(chatId, text.replace('/pdfallow ', '').trim());
+    return true;
+  }
+  if (text.startsWith('/pdfdisallow ')) {
+    await handlePdfDisallow(chatId, text.replace('/pdfdisallow ', '').trim());
     return true;
   }
   if (text.startsWith('/addblock ')) {
@@ -1840,6 +1987,7 @@ module.exports = async (req, res) => {
             `ابعتلي سؤال أو أكتر (سؤال في كل سطر)، أو ملف PDF/TXT فيه أسئلة، وهدور عليهم في الكتاب.\n\n` +
             `📚 لو فيه أكتر من كتاب متاح، اختار اللي عايزه عبر /mybook.\n\n` +
             `📝📄 كل ما تبعت سؤال أو أسئلة، هسألك عايز تستلم الإجابة إزاي: نص، ملف PDF منسّق، أو الاثنين.\n\n` +
+            `🎨 عايز تغيّر اللون الأساسي لتصميم ملف الـ PDF؟ جرّب /pdfcolor.\n\n` +
             `🔑 عايز أولوية إضافية في حصة الاستخدام اليومية؟ أضف مفتاح Gemini API الخاص بك (مجاني) عبر /addkey.`;
         await telegram.sendMessage(chatId, welcomeText);
         await users.checkAndSendAlert(chatId, fromUser, telegram.sendMessage);
@@ -1851,6 +1999,8 @@ module.exports = async (req, res) => {
         await handleDebugCommand(chatId, text.slice('/debug '.length).trim());
       } else if (text.startsWith('/mybook')) {
         await handleMyBookCommand(chatId, fromUser.id);
+      } else if (text.startsWith('/pdfcolor')) {
+        await handlePdfColorCommand(chatId, fromUser.id);
       } else if (text.startsWith('/addkey')) {
         await handleAddKeyStart(chatId, fromUser.id);
       } else if (text.startsWith('/mykeys')) {
