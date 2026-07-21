@@ -282,7 +282,7 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format)
     if (wantsPdf) {
       try {
         const pdfBuffer = await generateAnswersPdf(results, {
-          title: 'إجابات الأسئلة',
+          title: 'Question Answers',
           bookName: book.name,
         });
         await telegram.sendDocument(chatId, pdfBuffer, `answers_${Date.now()}.pdf`, {
