@@ -58,11 +58,33 @@ function escapeHtml(text) {
 // 📚 Book Q&A (existing behavior, unchanged)
 // =========================================================
 
+// Telegram has no real table rendering, so a comparison question (see
+// lib/batchAnswer.js's isComparison/comparisonTable) is rendered here as
+// one indented sub-line per column, per row, instead of a grid — the PDF
+// path (lib/pdfGenerator.js) still draws it as an actual bordered table.
+function formatComparisonAsText(table) {
+  const columns = (table && table.columns) || [];
+  const rows = (table && table.rows) || [];
+  if (columns.length < 2 || rows.length === 0) return '';
+  const otherCols = columns.slice(1);
+  return rows
+    .map((row) => {
+      const label = row[0] || '';
+      const sub = otherCols.map((colName, i) => `   • ${colName}: ${row[i + 1] || ''}`).join('\n');
+      return `${label}\n${sub}`;
+    })
+    .join('\n\n');
+}
+
 function formatResults(results) {
   return results
     .map((r, i) => {
       const pageNote = r.page ? ` _(صفحة ${r.page})_` : '';
-      return `*${i + 1}.* ${r.question}\n${r.answer}${pageNote}`;
+      const body =
+        r.isComparison && r.comparisonTable
+          ? `${r.answer ? r.answer + '\n\n' : ''}${formatComparisonAsText(r.comparisonTable)}`
+          : r.answer;
+      return `*${i + 1}.* ${r.question}\n${body}${pageNote}`;
     })
     .join('\n\n');
 }
