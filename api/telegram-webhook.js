@@ -1807,11 +1807,53 @@ async function handleCallbackQuery(cb) {
     return;
   }
 
+  // 🖼️ Per-batch PDF design choice — data is "ansdsg_<designId>_<token>".
+  // Shown right after ansfmt_ picked pdf/both (see buildDesignKeyboard
+  // above). Stores the chosen design on the still-staged batch (same
+  // "stage now, ask later" pattern the format step uses) and moves on to
+  // the color step. Access is re-checked here too, in case it was
+  // revoked between the buttons being shown and tapped.
+  if (data.startsWith('ansdsg_')) {
+    const rest = data.slice('ansdsg_'.length);
+    const sepIdx = rest.indexOf('_');
+    const designId = sepIdx === -1 ? rest : rest.slice(0, sepIdx);
+    const token = sepIdx === -1 ? '' : rest.slice(sepIdx + 1);
+
+    if (!pdfDesigns.isValidDesignId(designId)) {
+      await telegram.answerCallbackQuery(cb.id);
+      return;
+    }
+
+    const accessibleForDesign = await pdfAccess.getAccessibleDesigns(userId, isAdmin);
+    if (!accessibleForDesign.some((d) => d.id === designId)) {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ التصميم ده مش متاح لحسابك حالياً.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    const updatedWithDesign = await pendingBatches.updateBatch(userId, token, { designId });
+    if (!updatedWithDesign) {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    const chosenDesign = pdfDesigns.DESIGNS[designId];
+    await telegram.answerCallbackQuery(cb.id, { text: `✅ ${chosenDesign.label}` });
+    await telegram.editMessageText(chatId, messageId, `🎨 اختار لون ملف الـ PDF:`, {
+      reply_markup: buildColorKeyboard(token),
+    });
+    return;
+  }
+
   // 🎨 Per-batch PDF color choice — data is "ansclr_<colorKey>_<token>".
-  // Final step after ansfmt_ picked pdf/both: picks which registered
-  // design the user currently has access to (see resolveDesignForUser),
-  // consumes the batch, and answers. Nothing here is persisted — the
-  // next batch asks again from scratch.
+  // Final step after ansdsg_ picked a design: uses the designId staged on
+  // the batch by that step, consumes the batch, and answers. Nothing here
+  // is persisted — the next batch asks again from scratch.
   if (data.startsWith('ansclr_')) {
     const rest = data.slice('ansclr_'.length);
     const sepIdx = rest.indexOf('_');
@@ -1823,23 +1865,26 @@ async function handleCallbackQuery(cb) {
       return;
     }
 
-    const designId = await resolveDesignForUser(userId);
-    if (!designId) {
-      await telegram.answerCallbackQuery(cb.id, {
-        text: '⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.',
-        show_alert: true,
-      });
-      return;
-    }
-
     const pending = await pendingBatches.takeBatch(userId, token);
-    if (!pending || !pending.format) {
+    if (!pending || !pending.format || !pending.designId) {
       await telegram.answerCallbackQuery(cb.id, {
         text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
         show_alert: true,
       });
       return;
     }
+
+    // Re-check design access in case it was revoked between the design
+    // button being tapped and the color button being tapped.
+    const accessibleAtColorStep = await pdfAccess.getAccessibleDesigns(userId, isAdmin);
+    if (!accessibleAtColorStep.some((d) => d.id === pending.designId)) {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.',
+        show_alert: true,
+      });
+      return;
+    }
+    const designId = pending.designId;
 
     const book = await books.getBook(pending.bookId);
     if (!book || book.status !== 'ready') {
