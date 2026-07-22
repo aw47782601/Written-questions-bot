@@ -1814,12 +1814,20 @@ async function handleCallbackQuery(cb) {
   // the color step. Access is re-checked here too, in case it was
   // revoked between the buttons being shown and tapped.
   if (data.startsWith('ansdsg_')) {
+    // Registered design ids (e.g. "design_1") contain an underscore
+    // themselves, so a naive "split on the first underscore" (which works
+    // fine for ansfmt_/ansclr_, whose values never contain one) would cut
+    // "design_1_<token>" into designId="design" + token="1_<token>" — an
+    // invalid id, so the button did nothing. Match against the known
+    // design ids instead of guessing where the id ends.
     const rest = data.slice('ansdsg_'.length);
-    const sepIdx = rest.indexOf('_');
-    const designId = sepIdx === -1 ? rest : rest.slice(0, sepIdx);
-    const token = sepIdx === -1 ? '' : rest.slice(sepIdx + 1);
+    const matchedDesign = pdfDesigns
+      .listDesigns()
+      .find((d) => rest === d.id || rest.startsWith(`${d.id}_`));
+    const designId = matchedDesign ? matchedDesign.id : null;
+    const token = matchedDesign ? rest.slice(matchedDesign.id.length + 1) : '';
 
-    if (!pdfDesigns.isValidDesignId(designId)) {
+    if (!designId) {
       await telegram.answerCallbackQuery(cb.id);
       return;
     }
