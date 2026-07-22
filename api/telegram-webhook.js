@@ -118,24 +118,32 @@ function markupToHtml(text) {
   return escapeHtml(text).replace(/\*([^*]+)\*/g, '<b>$1</b>');
 }
 
-// HTML/spoiler counterpart of formatResults — used when the user picked
-// "🙈 نص مشوش": every answer body (plain or comparison-table) is wrapped in
+// HTML/spoiler formatter for ONE result — used when the user picked
+// "🙈 نص مشوش": the answer body (plain or comparison-table) is wrapped in
 // <tg-spoiler>, Telegram's native "blurred, tap to reveal" entity, so the
 // text is genuinely hidden until the person taps it, not just visually
-// styled. Requires the message to be sent with parse_mode: 'HTML' (see
-// telegram.sendMessage/sendLongMessage).
-function formatResultsSpoiler(results) {
-  return results
-    .map((r, i) => {
-      const pageNote = r.page ? ` <i>(صفحة ${r.page})</i>` : '';
-      const bodyRaw =
-        r.isComparison && r.comparisonTable
-          ? `${r.answer ? r.answer + '\n\n' : ''}${formatComparisonAsText(r.comparisonTable)}`
-          : r.answer;
-      const bodyHtml = markupToHtml(bodyRaw);
-      return `<b>${i + 1}.</b> ${escapeHtml(r.question)}\n<tg-spoiler>${bodyHtml}</tg-spoiler>${pageNote}`;
-    })
-    .join('\n\n');
+// styled. A blank line separates the question line from the spoiled
+// answer so the spoiler bar doesn't sit right against the question text.
+// Requires the message to be sent with parse_mode: 'HTML'.
+function formatResultSpoiler(r, i) {
+  const pageNote = r.page ? ` <i>(صفحة ${r.page})</i>` : '';
+  const bodyRaw =
+    r.isComparison && r.comparisonTable
+      ? `${r.answer ? r.answer + '\n\n' : ''}${formatComparisonAsText(r.comparisonTable)}`
+      : r.answer;
+  const bodyHtml = markupToHtml(bodyRaw);
+  return `<b>${i + 1}.</b> ${escapeHtml(r.question)}\n\n<tg-spoiler>${bodyHtml}</tg-spoiler>${pageNote}`;
+}
+
+// Sends each question as its OWN Telegram message in 🙈 نص مشوش mode
+// (rather than one combined message/sendLongMessage call), so each
+// spoiler is its own separate bubble the person taps individually. Still
+// goes through sendLongMessage per-question in case any single answer is
+// long enough to need splitting on its own.
+async function sendSpoilerResults(chatId, results) {
+  for (let i = 0; i < results.length; i++) {
+    await telegram.sendLongMessage(chatId, formatResultSpoiler(results[i], i), { parse_mode: 'HTML' });
+  }
 }
 
 function bookNameFromFileName(fileName) {
@@ -196,13 +204,13 @@ function buildColorKeyboard(token) {
   return { inline_keyboard: buttons };
 }
 
-// Final step for every format (text, pdf, or both) — asks whether the
-// answer(s) should be delivered "🙈 نص مشوش" (spoiler-hidden: a Telegram
-// tg-spoiler entity for the text reply, and same-color-as-background
-// masked text for the PDF — see formatResultsSpoiler / lib/pdfGenerator.js)
-// instead of plainly visible. This is what makes "PDF + نص" (format
-// 'both') deliver spoiler answers too — the toggle applies to whichever
-// format was already chosen, not just to a standalone text option.
+// Final step for 'text' and 'both' — asks whether the answer(s) should be
+// delivered "🙈 نص مشوش" (spoiler-hidden: a separate Telegram message per
+// question, each with its answer behind a tg-spoiler tap-to-reveal tag —
+// see sendSpoilerResults) instead of plainly visible. Spoiler ONLY ever
+// affects the text reply — the PDF (if 'both' also included one) is
+// always rendered normally; format 'pdf' alone skips this step entirely
+// (see the ansclr_ handler).
 function buildSpoilerKeyboard(token) {
   return {
     inline_keyboard: [
@@ -402,7 +410,7 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
 
     if (wantsText) {
       if (spoiler) {
-        await telegram.sendLongMessage(chatId, formatResultsSpoiler(results), { parse_mode: 'HTML' });
+        await sendSpoilerResults(chatId, results);
       } else {
         await telegram.sendLongMessage(chatId, formatResults(results));
       }
@@ -418,18 +426,20 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
         await telegram.sendMessage(chatId, '⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.');
         if (!wantsText) {
           if (spoiler) {
-            await telegram.sendLongMessage(chatId, formatResultsSpoiler(results), { parse_mode: 'HTML' });
+            await sendSpoilerResults(chatId, results);
           } else {
             await telegram.sendLongMessage(chatId, formatResults(results));
           }
         }
       } else {
         try {
+          // Spoiler mode never applies to the PDF — only the text reply
+          // gets the 🙈 spoiler treatment (see sendSpoilerResults above);
+          // the PDF is always rendered as plain, fully visible answers.
           const pdfBuffer = await pdfDesigns.renderPdf(effectiveDesignId, results, {
             title: 'Question Answers',
             bookName: book.name,
             colorKey: colorKey || pdfColors.DEFAULT_PDF_COLOR,
-            spoiler,
           });
           await telegram.sendDocument(chatId, pdfBuffer, `answers_${Date.now()}.pdf`, {
             caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"`,
@@ -442,7 +452,7 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
             // PDF was the only requested format and it failed — make sure
             // the user isn't left with nothing.
             if (spoiler) {
-              await telegram.sendLongMessage(chatId, formatResultsSpoiler(results), { parse_mode: 'HTML' });
+              await sendSpoilerResults(chatId, results);
             } else {
               await telegram.sendLongMessage(chatId, formatResults(results));
             }
@@ -1960,11 +1970,11 @@ async function handleCallbackQuery(cb) {
 
   // 🎨 Per-batch PDF color choice — data is "ansclr_<colorKey>_<token>".
   // After ansdsg_ picked a design: stores the color on the still-staged
-  // batch and moves on to the 🙈 نص مشوش spoiler question (see
-  // buildSpoilerKeyboard / ansspl_ below) instead of answering right away —
-  // the batch stays staged (updateBatch, not takeBatch) until that final
-  // step. Nothing here is persisted — the next batch asks again from
-  // scratch.
+  // batch. Format 'both' moves on to the 🙈 نص مشوش spoiler question (see
+  // buildSpoilerKeyboard / ansspl_ below), since spoiler only ever affects
+  // the text reply; format 'pdf' has no text reply, so it skips straight
+  // to answering. Nothing here is persisted — the next batch asks again
+  // from scratch.
   if (data.startsWith('ansclr_')) {
     const rest = data.slice('ansclr_'.length);
     const sepIdx = rest.indexOf('_');
@@ -2016,6 +2026,30 @@ async function handleCallbackQuery(cb) {
     }
 
     const preset = pdfColors.PDF_COLOR_PRESETS[colorKey];
+
+    // Spoiler only ever affects the TEXT reply — a pure 'pdf' pick has no
+    // text component, so there's nothing to ask about; answer right away
+    // instead of showing a pointless spoiler step. 'both' still asks,
+    // since it does include a text reply.
+    if (peeked.format === 'pdf') {
+      const finalPending = await pendingBatches.takeBatch(userId, token);
+      if (!finalPending) {
+        await telegram.answerCallbackQuery(cb.id, {
+          text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
+          show_alert: true,
+        });
+        return;
+      }
+      await telegram.answerCallbackQuery(cb.id, { text: `✅ ${preset.emoji} ${preset.label}` });
+      await telegram.editMessageText(
+        chatId,
+        messageId,
+        `⏳ تمام، جاري تجهيز الإجابة بصيغة: ${FORMAT_LABELS[finalPending.format]} (${preset.emoji} ${preset.label})...`
+      );
+      await processBatchWithFormat(chatId, finalPending.questions, book, cb.from, finalPending.format, finalPending.designId, colorKey);
+      return;
+    }
+
     await telegram.answerCallbackQuery(cb.id, { text: `✅ ${preset.emoji} ${preset.label}` });
     await telegram.editMessageText(chatId, messageId, `🙈 تحب الإجابة تبقى مشوشة (تتفتح بالضغط) ولا عادية؟`, {
       reply_markup: buildSpoilerKeyboard(token),
@@ -2024,9 +2058,10 @@ async function handleCallbackQuery(cb) {
   }
 
   // 🙈 Per-batch spoiler choice — data is "ansspl_<yes|no>_<token>". Final
-  // step for every format (text, pdf, or both — see the ansfmt_/ansclr_
-  // handlers above, which both route here instead of answering directly).
-  // Consumes the batch and actually runs the answering + delivery.
+  // step for 'text' and 'both' (see the ansfmt_/ansclr_ handlers above,
+  // which route here instead of answering directly; pure 'pdf' skips this
+  // step entirely since spoiler never applies to it). Consumes the batch
+  // and actually runs the answering + delivery.
   if (data.startsWith('ansspl_')) {
     const rest = data.slice('ansspl_'.length);
     const sepIdx = rest.indexOf('_');
