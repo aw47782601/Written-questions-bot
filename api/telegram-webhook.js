@@ -351,9 +351,8 @@ function buildCollectKeyboard() {
 
 function buildCollectStatusText(count) {
   return (
-    `📝 وضع تجميع الأسئلة مفعّل.\n\n` +
-    `ابعتلي أسئلتك (تقدر تبعتها على أكتر من رسالة، هيتم تجميعهم كلهم مع بعض).\n` +
-    `لما تخلص، دوس *✅ ابدأ التحليل* عشان تستلم كل الإجابات مع بعض (PDF واحد لو اخترت PDF).\n\n` +
+    `📝 جاري تجميع الأسئلة...\n\n` +
+    `دوس *✅ ابدأ التحليل* لما تخلص عشان تستلم كل الإجابات مع بعض (PDF واحد لو اخترت PDF)، أو *❌ إلغاء* لو عايز تلغي.\n\n` +
     `🔢 عدد الأسئلة اللي اتجمعت لحد دلوقتي: *${count}*`
   );
 }
@@ -361,37 +360,41 @@ function buildCollectStatusText(count) {
 async function handleStartCollectCommand(chatId, userId) {
   const existing = await collectSession.getSession(userId);
   if (existing) {
-    await telegram.sendMessage(
-      chatId,
-      `📝 وضع التجميع شغال بالفعل (${existing.questions.length} سؤال لحد دلوقتي).\n` +
-        `كمّل ابعت أسئلتك، أو دوس على الأزرار في الرسالة اللي فوق.`
-    );
+    const note = existing.messageId
+      ? 'كمّل ابعت أسئلتك، أو دوس على الأزرار في الرسالة اللي فيها العداد.'
+      : 'كمّل ابعتلي أسئلتك.';
+    await telegram.sendMessage(chatId, `📝 وضع التجميع شغال بالفعل (${existing.questions.length} سؤال لحد دلوقتي).\n${note}`);
     return;
   }
-  const sent = await telegram.sendMessage(chatId, buildCollectStatusText(0), {
-    parse_mode: 'Markdown',
-    reply_markup: buildCollectKeyboard(),
-  });
-  const messageId = sent && sent.result && sent.result.message_id;
-  if (!messageId) {
-    // Couldn't get a message_id back to anchor edits to (rare) — bail out
-    // rather than starting a session we can never update in place.
-    return;
-  }
-  await collectSession.startSession(userId, chatId, messageId);
+  // Just the plain notice for now — no count, no buttons, since nothing
+  // has been collected yet. The count+buttons message only appears once
+  // the first set of questions actually arrives (see handleCollectMessage).
+  await telegram.sendMessage(chatId, '📝 وضع تجميع الأسئلة مفعّل.\n\nابعتلي أسئلتك (تقدر تبعتها على أكتر من رسالة، هيتم تجميعهم كلهم مع بعض).');
+  await collectSession.startSession(userId, chatId);
 }
 
-// Appends `text` to the active collect session (if any) and edits the
-// ONE anchor status message with the new count — never sends a new
-// message per incoming chunk. Returns true if a session was active (and
-// therefore handled the message), false if there's no active session
-// (caller should tell the user to use /text instead of analyzing anything).
+// Appends `text` to the active collect session (if any). The FIRST set of
+// questions received sends a NEW message with the count + ✅/❌ buttons
+// (becoming the anchor); every set after that EDITS that same anchor
+// message instead of sending a new one. Returns true if a session was
+// active (and therefore handled the message), false if there's no active
+// session (caller should tell the user to use /text instead of analyzing
+// anything).
 async function handleCollectMessage(chatId, userId, text) {
   const before = await collectSession.getSession(userId);
   if (!before) return false;
 
   const updated = await collectSession.addText(userId, text);
-  if (updated.questions.length !== before.questions.length) {
+  if (updated.questions.length === before.questions.length) return true; // nothing new extracted from this message
+
+  if (!updated.messageId) {
+    const sent = await telegram.sendMessage(chatId, buildCollectStatusText(updated.questions.length), {
+      parse_mode: 'Markdown',
+      reply_markup: buildCollectKeyboard(),
+    });
+    const messageId = sent && sent.result && sent.result.message_id;
+    if (messageId) await collectSession.setAnchorMessage(userId, messageId);
+  } else {
     await telegram.editMessageText(
       updated.chatId,
       updated.messageId,
