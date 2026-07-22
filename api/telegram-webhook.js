@@ -104,24 +104,25 @@ function buildFormatKeyboard(token, pdfAllowed) {
   return { inline_keyboard: buttons };
 }
 
-// Shown after the user picks pdf/both, so they choose a color for THIS
+// Shown after the user picks pdf/both — one button per PDF design they
+// currently have access to (see lib/pdfDesigns.js / lib/pdfAccess.js).
+// Comes BEFORE the color step (see buildColorKeyboard below) so the design
+// choice is always asked explicitly instead of silently auto-picking, since
+// more designs are expected to be registered later.
+function buildDesignKeyboard(token, accessibleDesigns) {
+  const buttons = accessibleDesigns.map((d) => [
+    { text: `🖼️ ${d.label}`, callback_data: `ansdsg_${d.id}_${token}` },
+  ]);
+  return { inline_keyboard: buttons };
+}
+
+// Shown after the user picks a design, so they choose a color for THIS
 // PDF only (nothing persisted — see the block comment above).
 function buildColorKeyboard(token) {
   const buttons = pdfColors.listPdfColors().map((c) => [
     { text: `${c.emoji} ${c.label}`, callback_data: `ansclr_${c.key}_${token}` },
   ]);
   return { inline_keyboard: buttons };
-}
-
-// Picks which registered design (lib/pdfDesigns.js) to render a user's PDF
-// with, out of the ones the admin currently allows them to use. There's
-// only one design today, so this is just a passthrough, but it's written
-// against the full registry so adding a second design later doesn't
-// require touching this call site — it'll just pick the first one this
-// particular user has access to.
-async function resolveDesignForUser(userId) {
-  const accessible = await pdfAccess.getAccessibleDesigns(userId, isAdmin);
-  return accessible.length > 0 ? accessible[0].id : null;
 }
 
 // Called only when the admin explicitly started the "➕ إضافة كتاب جديد"
@@ -1774,8 +1775,8 @@ async function handleCallbackQuery(cb) {
       }
 
       await telegram.answerCallbackQuery(cb.id, { text: `✅ ${FORMAT_LABELS[format]}` });
-      await telegram.editMessageText(chatId, messageId, `🎨 اختار اللون الأساسي لملف الـ PDF ده:`, {
-        reply_markup: buildColorKeyboard(token),
+      await telegram.editMessageText(chatId, messageId, `🖼️ اختار تصميم ملف الـ PDF:`, {
+        reply_markup: buildDesignKeyboard(token, accessible),
       });
       return;
     }
