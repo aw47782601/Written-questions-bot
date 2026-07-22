@@ -214,7 +214,7 @@ function buildColorKeyboard(token) {
 function buildSpoilerKeyboard(token) {
   return {
     inline_keyboard: [
-      [{ text: '🙈 نص مشوش (يتفتح بالضغط/التحديد)', callback_data: `ansspl_yes_${token}` }],
+      [{ text: '🙈 نص مشوش (يتفتح بالضغط)', callback_data: `ansspl_yes_${token}` }],
       [{ text: '👁️ إجابة عادية (مكشوفة)', callback_data: `ansspl_no_${token}` }],
     ],
   };
