@@ -4,12 +4,11 @@ const books = require('../lib/books');
 const gemini = require('../lib/gemini');
 const { keywordSearchChunks, debugRetrieve } = require('../lib/rag');
 const {
-  MAX_QUESTIONS,
   extractQuestionsFromPdfBuffer,
   extractQuestionsFromPlainTextBuffer,
-  extractQuestionsFromText,
 } = require('../lib/questionExtractor');
 const { answerQuestions } = require('../lib/batchAnswer');
+const collectSession = require('../lib/collectSession');
 const pdfDesigns = require('../lib/pdfDesigns');
 const pdfAccess = require('../lib/pdfAccess');
 const pdfColors = require('../lib/pdfColors');
@@ -318,6 +317,118 @@ function buildUsageReportLines(usage) {
   }
 
   return lines;
+}
+
+// =========================================================
+// 📥 /text collect mode — this is now the ONLY way a plain-text question
+// (or set of questions) gets analyzed. A user who sends a question
+// without first running /text gets told to use /text instead of getting
+// an immediate answer (see the plain-text dispatch below).
+//
+// /text            -> starts collecting; sends ONE status message with
+//                      "✅ ابدأ التحليل" / "❌ إلغاء" buttons. This message
+//                      gets EDITED in place (never re-sent) every time a
+//                      new set of questions comes in — count goes up,
+//                      buttons stay.
+// (plain text)      -> appended to the running list while collecting is
+//                      on; ignored (with a nudge to /text) otherwise.
+// ✅ ابدأ التحليل   -> ends collecting and runs the full merged list
+//                      through the normal handleQuestionsBatch flow (one
+//                      batch, one format choice, one PDF if PDF chosen).
+// ❌ إلغاء          -> discards the collected questions without answering.
+// =========================================================
+
+function buildCollectKeyboard() {
+  return {
+    inline_keyboard: [
+      [
+        { text: '✅ ابدأ التحليل', callback_data: 'col_start' },
+        { text: '❌ إلغاء', callback_data: 'col_cancel' },
+      ],
+    ],
+  };
+}
+
+function buildCollectStatusText(count) {
+  return (
+    `📝 وضع تجميع الأسئلة مفعّل.\n\n` +
+    `ابعتلي أسئلتك (تقدر تبعتها على أكتر من رسالة، هيتم تجميعهم كلهم مع بعض).\n` +
+    `لما تخلص، دوس *✅ ابدأ التحليل* عشان تستلم كل الإجابات مع بعض (PDF واحد لو اخترت PDF).\n\n` +
+    `🔢 عدد الأسئلة اللي اتجمعت لحد دلوقتي: *${count}*`
+  );
+}
+
+async function handleStartCollectCommand(chatId, userId) {
+  const existing = await collectSession.getSession(userId);
+  if (existing) {
+    await telegram.sendMessage(
+      chatId,
+      `📝 وضع التجميع شغال بالفعل (${existing.questions.length} سؤال لحد دلوقتي).\n` +
+        `كمّل ابعت أسئلتك، أو دوس على الأزرار في الرسالة اللي فوق.`
+    );
+    return;
+  }
+  const sent = await telegram.sendMessage(chatId, buildCollectStatusText(0), {
+    parse_mode: 'Markdown',
+    reply_markup: buildCollectKeyboard(),
+  });
+  const messageId = sent && sent.result && sent.result.message_id;
+  if (!messageId) {
+    // Couldn't get a message_id back to anchor edits to (rare) — bail out
+    // rather than starting a session we can never update in place.
+    return;
+  }
+  await collectSession.startSession(userId, chatId, messageId);
+}
+
+// Appends `text` to the active collect session (if any) and edits the
+// ONE anchor status message with the new count — never sends a new
+// message per incoming chunk. Returns true if a session was active (and
+// therefore handled the message), false if there's no active session
+// (caller should tell the user to use /text instead of analyzing anything).
+async function handleCollectMessage(chatId, userId, text) {
+  const before = await collectSession.getSession(userId);
+  if (!before) return false;
+
+  const updated = await collectSession.addText(userId, text);
+  if (updated.questions.length !== before.questions.length) {
+    await telegram.editMessageText(
+      updated.chatId,
+      updated.messageId,
+      buildCollectStatusText(updated.questions.length),
+      { parse_mode: 'Markdown', reply_markup: buildCollectKeyboard() }
+    );
+  }
+  return true;
+}
+
+// "✅ ابدأ التحليل" button — ends collecting and hands the merged batch
+// off to the normal handleQuestionsBatch flow. `messageId`/`chatId` here
+// are the anchor status message's, so it's edited (buttons removed)
+// rather than left sitting there as if still collecting.
+async function handleCollectStartButton(chatId, messageId, fromUser) {
+  const session = await collectSession.endSession(fromUser.id);
+  if (!session || session.questions.length === 0) {
+    await telegram.editMessageText(chatId, messageId, '⚠️ مفيش أسئلة اتجمعت. ابعت /text وبعدين ابعتلي الأسئلة.', {
+      reply_markup: { inline_keyboard: [] },
+    });
+    return;
+  }
+  await telegram.editMessageText(
+    chatId,
+    messageId,
+    `✅ جاري تجهيز الإجابات لـ ${session.questions.length} سؤال...`,
+    { reply_markup: { inline_keyboard: [] } }
+  );
+  await handleQuestionsBatch(chatId, session.questions, fromUser);
+}
+
+// "❌ إلغاء" button — discards the session and clears the buttons.
+async function handleCollectCancelButton(chatId, messageId, userId) {
+  await collectSession.cancelSession(userId);
+  await telegram.editMessageText(chatId, messageId, '🗑️ تم إلغاء تجميع الأسئلة.', {
+    reply_markup: { inline_keyboard: [] },
+  });
 }
 
 // fromUser (optional): the Telegram `from` object of whoever sent the
@@ -1694,6 +1805,20 @@ async function handleCallbackQuery(cb) {
     return;
   }
 
+  // 📥 /text collect-mode buttons — "✅ ابدأ التحليل" / "❌ إلغاء" shown on
+  // the one anchor status message (see handleStartCollectCommand /
+  // handleCollectMessage above).
+  if (data === 'col_start') {
+    await telegram.answerCallbackQuery(cb.id, { text: '✅ جاري التحليل...' });
+    await handleCollectStartButton(chatId, messageId, cb.from);
+    return;
+  }
+  if (data === 'col_cancel') {
+    await telegram.answerCallbackQuery(cb.id, { text: '❌ تم الإلغاء.' });
+    await handleCollectCancelButton(chatId, messageId, userId);
+    return;
+  }
+
   // ⏳ /addblock button-based date & AM/PM time picker — admin-only.
   if (data.startsWith('blk_')) {
     if (!isAdmin(userId)) {
@@ -2444,6 +2569,7 @@ module.exports = async (req, res) => {
             `ابعتلي سؤال أو أكتر (سؤال في كل سطر)، أو ملف PDF/TXT فيه أسئلة، وهدور عليهم في الكتاب.\n\n` +
             `📚 لو فيه أكتر من كتاب متاح، اختار اللي عايزه عبر /mybook.\n\n` +
             `📝📄🎨 كل ما تبعت سؤال أو أسئلة، هسألك عايز تستلم الإجابة إزاي: نص، ملف PDF منسّق، أو الاثنين — ولو اخترت PDF هسألك كمان تعايز أي لون ليه، في كل مرة.\n\n` +
+            `📥 عشان أدور على أسئلتك لازم تبدأ بالأمر /text الأول (تقدر تبعت الأسئلة بعد كده في أكتر من رسالة وهتتجمع مع بعض)، وبعدين دوس *✅ ابدأ التحليل* في نفس الرسالة عشان تستلم إجابة واحدة (وPDF واحد لو اخترت PDF)، أو *❌ إلغاء* لو عايز تلغي.\n\n` +
             `🔑 عايز أولوية إضافية في حصة الاستخدام اليومية؟ أضف مفتاح Gemini API الخاص بك (مجاني) عبر /addkey.`;
         await telegram.sendMessage(chatId, welcomeText);
         await users.checkAndSendAlert(chatId, fromUser, telegram.sendMessage);
@@ -2461,8 +2587,10 @@ module.exports = async (req, res) => {
         await handleMyKeys(chatId, fromUser.id);
       } else if (text.startsWith('/removekey')) {
         await handleRemoveKeyPrompt(chatId, fromUser.id);
+      } else if (text.startsWith('/text')) {
+        await handleStartCollectCommand(chatId, fromUser.id);
       } else if (text.startsWith('/')) {
-        await telegram.sendMessage(chatId, 'ابعتلي سؤال أو أكتر (سؤال في كل سطر) وهدور عليهم في الكتاب.');
+        await telegram.sendMessage(chatId, 'ابعت /text الأول، وبعدين ابعتلي سؤال أو أكتر (سؤال في كل سطر) وهدور عليهم في الكتاب.');
       } else {
         // Plain text: could be a pending admin book action (rename / new
         // book name from the button flow), a Gemini key being pasted (if
@@ -2502,8 +2630,18 @@ module.exports = async (req, res) => {
           !handledAsPdfAddUser &&
           !handledAsKeyPaste
         ) {
-          const questions = extractQuestionsFromText(text).slice(0, MAX_QUESTIONS);
-          await handleQuestionsBatch(chatId, questions, fromUser);
+          // Analysis only ever happens through /text collect mode now.
+          // If a session is active, fold this message's questions into
+          // the running batch (editing the one anchor status message).
+          // Otherwise, don't analyze anything — just point the user at
+          // /text instead of answering immediately.
+          const collected = await handleCollectMessage(chatId, fromUser.id, text);
+          if (!collected) {
+            await telegram.sendMessage(
+              chatId,
+              '📝 عشان أدور على أسئلتك، ابعت الأمر /text الأول وبعدين ابعتلي الأسئلة.'
+            );
+          }
         }
       }
     }
