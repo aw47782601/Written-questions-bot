@@ -89,6 +89,55 @@ function formatResults(results) {
     .join('\n\n');
 }
 
+// A question "wasn't answered" when Gemini couldn't match it to any real
+// book content (page === null — includes both the "مش واضحة" fallback
+// text and the isError retry-message case) — see lib/batchAnswer.js. Those
+// get moved to the END of the array, after every genuinely-answered
+// question, so the numbering the user sees (Q1, Q2, ... in both the PDF
+// and the text reply) stays a clean, undisturbed sequence for the
+// questions that DID get answered, with the unanswered one(s) trailing
+// after with whatever numbers are left — instead of an unanswered
+// question in the middle of the batch bumping every later question's
+// number for no useful reason. Order is otherwise preserved (stable
+// partition), both among the answered and among the unanswered items.
+function reorderUnansweredLast(results) {
+  const answered = [];
+  const unanswered = [];
+  results.forEach((r) => {
+    (r.isError || r.page === null ? unanswered : answered).push(r);
+  });
+  return [...answered, ...unanswered];
+}
+
+// Converts already-escaped-safe raw text into HTML, turning Gemini's
+// single-asterisk *bold* markup (see lib/batchAnswer.js) into real <b>
+// tags. Must run AFTER escapeHtml (asterisks aren't touched by it) so a
+// literal "<" or "&" inside the answer can't break the HTML the spoiler
+// message is sent with.
+function markupToHtml(text) {
+  return escapeHtml(text).replace(/\*([^*]+)\*/g, '<b>$1</b>');
+}
+
+// HTML/spoiler counterpart of formatResults — used when the user picked
+// "🙈 نص مشوش": every answer body (plain or comparison-table) is wrapped in
+// <tg-spoiler>, Telegram's native "blurred, tap to reveal" entity, so the
+// text is genuinely hidden until the person taps it, not just visually
+// styled. Requires the message to be sent with parse_mode: 'HTML' (see
+// telegram.sendMessage/sendLongMessage).
+function formatResultsSpoiler(results) {
+  return results
+    .map((r, i) => {
+      const pageNote = r.page ? ` <i>(صفحة ${r.page})</i>` : '';
+      const bodyRaw =
+        r.isComparison && r.comparisonTable
+          ? `${r.answer ? r.answer + '\n\n' : ''}${formatComparisonAsText(r.comparisonTable)}`
+          : r.answer;
+      const bodyHtml = markupToHtml(bodyRaw);
+      return `<b>${i + 1}.</b> ${escapeHtml(r.question)}\n<tg-spoiler>${bodyHtml}</tg-spoiler>${pageNote}`;
+    })
+    .join('\n\n');
+}
+
 function bookNameFromFileName(fileName) {
   return fileName.replace(/\.pdf$/i, '').replace(/[_-]+/g, ' ').trim() || 'كتاب بدون اسم';
 }
@@ -145,6 +194,22 @@ function buildColorKeyboard(token) {
     { text: `${c.emoji} ${c.label}`, callback_data: `ansclr_${c.key}_${token}` },
   ]);
   return { inline_keyboard: buttons };
+}
+
+// Final step for every format (text, pdf, or both) — asks whether the
+// answer(s) should be delivered "🙈 نص مشوش" (spoiler-hidden: a Telegram
+// tg-spoiler entity for the text reply, and same-color-as-background
+// masked text for the PDF — see formatResultsSpoiler / lib/pdfGenerator.js)
+// instead of plainly visible. This is what makes "PDF + نص" (format
+// 'both') deliver spoiler answers too — the toggle applies to whichever
+// format was already chosen, not just to a standalone text option.
+function buildSpoilerKeyboard(token) {
+  return {
+    inline_keyboard: [
+      [{ text: '🙈 نص مشوش (يتفتح بالضغط/التحديد)', callback_data: `ansspl_yes_${token}` }],
+      [{ text: '👁️ إجابة عادية (مكشوفة)', callback_data: `ansspl_no_${token}` }],
+    ],
+  };
 }
 
 // Called only when the admin explicitly started the "➕ إضافة كتاب جديد"
@@ -308,7 +373,7 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
 // if it includes PDF, a design + color) for this specific batch — or
 // immediately with the defaults, for the fromUser === null edge case (see
 // handleQuestionsBatch).
-async function processBatchWithFormat(chatId, questions, book, fromUser, format, designId, colorKey) {
+async function processBatchWithFormat(chatId, questions, book, fromUser, format, designId, colorKey, spoiler = false) {
   const userLabel = fromUser
     ? `${escapeHtml(fromUser.first_name || '')}${fromUser.username ? ' (@' + escapeHtml(fromUser.username) + ')' : ''} — <code>${fromUser.id}</code>`
     : `<code>${chatId}</code>`;
@@ -326,13 +391,21 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
         extraKeys = ownKeys.map((k) => k.api_key);
       }
     }
-    const results = await answerQuestions(questions, book.id, extraKeys, usage);
+    const rawResults = await answerQuestions(questions, book.id, extraKeys, usage);
+    // Push any unanswered question(s) to the end so Q1, Q2, ... stays a
+    // clean, undisturbed sequence for the ones that DID get answered (see
+    // reorderUnansweredLast above).
+    const results = reorderUnansweredLast(rawResults);
 
     const wantsText = format === 'text' || format === 'both';
     const wantsPdf = format === 'pdf' || format === 'both';
 
     if (wantsText) {
-      await telegram.sendLongMessage(chatId, formatResults(results));
+      if (spoiler) {
+        await telegram.sendLongMessage(chatId, formatResultsSpoiler(results), { parse_mode: 'HTML' });
+      } else {
+        await telegram.sendLongMessage(chatId, formatResults(results));
+      }
     }
     let pdfSent = false;
     if (wantsPdf) {
@@ -343,13 +416,20 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
         // and this batch actually running — fall back to text so the
         // user isn't left with nothing.
         await telegram.sendMessage(chatId, '⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.');
-        if (!wantsText) await telegram.sendLongMessage(chatId, formatResults(results));
+        if (!wantsText) {
+          if (spoiler) {
+            await telegram.sendLongMessage(chatId, formatResultsSpoiler(results), { parse_mode: 'HTML' });
+          } else {
+            await telegram.sendLongMessage(chatId, formatResults(results));
+          }
+        }
       } else {
         try {
           const pdfBuffer = await pdfDesigns.renderPdf(effectiveDesignId, results, {
             title: 'Question Answers',
             bookName: book.name,
             colorKey: colorKey || pdfColors.DEFAULT_PDF_COLOR,
+            spoiler,
           });
           await telegram.sendDocument(chatId, pdfBuffer, `answers_${Date.now()}.pdf`, {
             caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"`,
@@ -361,7 +441,11 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
           if (!wantsText) {
             // PDF was the only requested format and it failed — make sure
             // the user isn't left with nothing.
-            await telegram.sendLongMessage(chatId, formatResults(results));
+            if (spoiler) {
+              await telegram.sendLongMessage(chatId, formatResultsSpoiler(results), { parse_mode: 'HTML' });
+            } else {
+              await telegram.sendLongMessage(chatId, formatResults(results));
+            }
           }
         }
       }
@@ -374,7 +458,7 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
     const total = results.length;
     const success = results.filter((r) => !r.isError && r.page !== null).length;
 
-    const formatLine = `📨 <b>صيغة الاستلام:</b> ${FORMAT_LABELS[format]}${wantsPdf && !pdfSent ? ' (⚠️ فشل إرسال الـ PDF)' : ''}`;
+    const formatLine = `📨 <b>صيغة الاستلام:</b> ${FORMAT_LABELS[format]}${spoiler ? ' 🙈 (نص مشوش)' : ''}${wantsPdf && !pdfSent ? ' (⚠️ فشل إرسال الـ PDF)' : ''}`;
     const reportLines = [
       `📊 <b>تقرير معالجة أسئلة</b>`,
       `👤 ${userLabel}`,
@@ -1803,9 +1887,12 @@ async function handleCallbackQuery(cb) {
       return;
     }
 
-    // format === 'text' — answer right away, no design/color needed.
-    const pending = await pendingBatches.takeBatch(userId, token);
-    if (!pending) {
+    // format === 'text' — no design/color needed, but still ask the
+    // 🙈 نص مشوش spoiler question before actually answering (see
+    // buildSpoilerKeyboard / ansspl_ below) — same "stage now, ask later"
+    // pattern the pdf/both path uses for design + color.
+    const updated = await pendingBatches.updateBatch(userId, token, { format });
+    if (!updated) {
       await telegram.answerCallbackQuery(cb.id, {
         text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
         show_alert: true,
@@ -1813,19 +1900,10 @@ async function handleCallbackQuery(cb) {
       return;
     }
 
-    const book = await books.getBook(pending.bookId);
-    if (!book || book.status !== 'ready') {
-      await telegram.answerCallbackQuery(cb.id, {
-        text: '⚠️ الكتاب ده مبقاش متاح. ابعت الأسئلة تاني.',
-        show_alert: true,
-      });
-      await telegram.editMessageText(chatId, messageId, '⚠️ الكتاب ده مبقاش متاح. ابعت الأسئلة تاني.');
-      return;
-    }
-
     await telegram.answerCallbackQuery(cb.id, { text: `✅ ${FORMAT_LABELS[format]}` });
-    await telegram.editMessageText(chatId, messageId, `⏳ تمام، جاري تجهيز الإجابة بصيغة: ${FORMAT_LABELS[format]}...`);
-    await processBatchWithFormat(chatId, pending.questions, book, cb.from, format);
+    await telegram.editMessageText(chatId, messageId, `🙈 تحب الإجابة تبقى مشوشة (تتفتح بالضغط) ولا عادية؟`, {
+      reply_markup: buildSpoilerKeyboard(token),
+    });
     return;
   }
 
@@ -1881,9 +1959,12 @@ async function handleCallbackQuery(cb) {
   }
 
   // 🎨 Per-batch PDF color choice — data is "ansclr_<colorKey>_<token>".
-  // Final step after ansdsg_ picked a design: uses the designId staged on
-  // the batch by that step, consumes the batch, and answers. Nothing here
-  // is persisted — the next batch asks again from scratch.
+  // After ansdsg_ picked a design: stores the color on the still-staged
+  // batch and moves on to the 🙈 نص مشوش spoiler question (see
+  // buildSpoilerKeyboard / ansspl_ below) instead of answering right away —
+  // the batch stays staged (updateBatch, not takeBatch) until that final
+  // step. Nothing here is persisted — the next batch asks again from
+  // scratch.
   if (data.startsWith('ansclr_')) {
     const rest = data.slice('ansclr_'.length);
     const sepIdx = rest.indexOf('_');
@@ -1895,8 +1976,8 @@ async function handleCallbackQuery(cb) {
       return;
     }
 
-    const pending = await pendingBatches.takeBatch(userId, token);
-    if (!pending || !pending.format || !pending.designId) {
+    const peeked = await pendingBatches.peekBatch(userId, token);
+    if (!peeked || !peeked.format || !peeked.designId) {
       await telegram.answerCallbackQuery(cb.id, {
         text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
         show_alert: true,
@@ -1907,14 +1988,76 @@ async function handleCallbackQuery(cb) {
     // Re-check design access in case it was revoked between the design
     // button being tapped and the color button being tapped.
     const accessibleAtColorStep = await pdfAccess.getAccessibleDesigns(userId, isAdmin);
-    if (!accessibleAtColorStep.some((d) => d.id === pending.designId)) {
+    if (!accessibleAtColorStep.some((d) => d.id === peeked.designId)) {
       await telegram.answerCallbackQuery(cb.id, {
         text: '⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.',
         show_alert: true,
       });
       return;
     }
-    const designId = pending.designId;
+
+    const book = await books.getBook(peeked.bookId);
+    if (!book || book.status !== 'ready') {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ الكتاب ده مبقاش متاح. ابعت الأسئلة تاني.',
+        show_alert: true,
+      });
+      await telegram.editMessageText(chatId, messageId, '⚠️ الكتاب ده مبقاش متاح. ابعت الأسئلة تاني.');
+      return;
+    }
+
+    const updatedWithColor = await pendingBatches.updateBatch(userId, token, { colorKey });
+    if (!updatedWithColor) {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    const preset = pdfColors.PDF_COLOR_PRESETS[colorKey];
+    await telegram.answerCallbackQuery(cb.id, { text: `✅ ${preset.emoji} ${preset.label}` });
+    await telegram.editMessageText(chatId, messageId, `🙈 تحب الإجابة تبقى مشوشة (تتفتح بالضغط) ولا عادية؟`, {
+      reply_markup: buildSpoilerKeyboard(token),
+    });
+    return;
+  }
+
+  // 🙈 Per-batch spoiler choice — data is "ansspl_<yes|no>_<token>". Final
+  // step for every format (text, pdf, or both — see the ansfmt_/ansclr_
+  // handlers above, which both route here instead of answering directly).
+  // Consumes the batch and actually runs the answering + delivery.
+  if (data.startsWith('ansspl_')) {
+    const rest = data.slice('ansspl_'.length);
+    const sepIdx = rest.indexOf('_');
+    const choice = sepIdx === -1 ? rest : rest.slice(0, sepIdx);
+    const token = sepIdx === -1 ? '' : rest.slice(sepIdx + 1);
+
+    if (choice !== 'yes' && choice !== 'no') {
+      await telegram.answerCallbackQuery(cb.id);
+      return;
+    }
+    const spoiler = choice === 'yes';
+
+    const pending = await pendingBatches.takeBatch(userId, token);
+    if (!pending || !pending.format) {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    // pdf/both must have made it through the design + color steps first —
+    // guards against a stray/replayed ansspl_ press on a batch that never
+    // actually finished those steps.
+    if ((pending.format === 'pdf' || pending.format === 'both') && (!pending.designId || !pending.colorKey)) {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
+        show_alert: true,
+      });
+      return;
+    }
 
     const book = await books.getBook(pending.bookId);
     if (!book || book.status !== 'ready') {
@@ -1926,14 +2069,23 @@ async function handleCallbackQuery(cb) {
       return;
     }
 
-    const preset = pdfColors.PDF_COLOR_PRESETS[colorKey];
-    await telegram.answerCallbackQuery(cb.id, { text: `✅ ${preset.emoji} ${preset.label}` });
+    await telegram.answerCallbackQuery(cb.id, { text: spoiler ? '🙈 نص مشوش' : '👁️ إجابة عادية' });
+    const spoilerNote = spoiler ? ' 🙈' : '';
     await telegram.editMessageText(
       chatId,
       messageId,
-      `⏳ تمام، جاري تجهيز الإجابة بصيغة: ${FORMAT_LABELS[pending.format]} (${preset.emoji} ${preset.label})...`
+      `⏳ تمام، جاري تجهيز الإجابة بصيغة: ${FORMAT_LABELS[pending.format]}${spoilerNote}...`
     );
-    await processBatchWithFormat(chatId, pending.questions, book, cb.from, pending.format, designId, colorKey);
+    await processBatchWithFormat(
+      chatId,
+      pending.questions,
+      book,
+      cb.from,
+      pending.format,
+      pending.designId,
+      pending.colorKey,
+      spoiler
+    );
     return;
   }
 
