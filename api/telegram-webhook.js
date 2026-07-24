@@ -145,6 +145,41 @@ async function sendSpoilerResults(chatId, results) {
   }
 }
 
+// Sends the actual book-page image for any answer whose evidence came
+// from an image chunk (see lib/batchAnswer.js, which sets r.imageBase64
+// when the cited page matched a chunk_type='image' row — i.e. the
+// answer/diagram lives on a page that has no useful extractable text).
+// Sent as its own set of Telegram photo messages, separate from the
+// text/PDF reply, since neither of those can embed an inline image.
+// Deduped by page number: if two different questions both point at the
+// same page, that page's image is only sent once, with a caption
+// listing every question number it answered.
+async function sendMatchedPageImages(chatId, results) {
+  const pageToQuestionNums = new Map(); // page_number -> [question numbers]
+  const pageToImage = new Map(); // page_number -> base64 string
+
+  results.forEach((r, i) => {
+    if (!r.imageBase64 || !r.page) return;
+    if (!pageToQuestionNums.has(r.page)) pageToQuestionNums.set(r.page, []);
+    pageToQuestionNums.get(r.page).push(i + 1);
+    pageToImage.set(r.page, r.imageBase64);
+  });
+
+  for (const [page, qNums] of pageToQuestionNums) {
+    try {
+      const buffer = Buffer.from(pageToImage.get(page), 'base64');
+      const qLabel = qNums.length > 1 ? `الأسئلة ${qNums.join('، ')}` : `السؤال ${qNums[0]}`;
+      await telegram.sendPhoto(chatId, buffer, {
+        caption: `🖼️ صفحة ${page} من الكتاب — مصدر إجابة ${qLabel}`,
+      });
+    } catch (err) {
+      // Best-effort: a failed image send shouldn't block/replace the
+      // text or PDF reply, which already went out (or is about to).
+      console.error(`sendMatchedPageImages failed for page ${page}:`, err.message);
+    }
+  }
+}
+
 function bookNameFromFileName(fileName) {
   return fileName.replace(/\.pdf$/i, '').replace(/[_-]+/g, ' ').trim() || 'كتاب بدون اسم';
 }
@@ -573,6 +608,17 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
           }
         }
       }
+    }
+
+    // Follow up with the actual page image(s) for any answer whose
+    // evidence came from an image chunk (diagram/figure/table that had
+    // no usable extractable text) — see sendMatchedPageImages above.
+    // Sent regardless of which format (text/pdf/both) was chosen, since
+    // it's the only way this evidence reaches the user at all — EXCEPT
+    // in spoiler mode, where sending the page image unblurred would
+    // hand over the answer anyway and defeat the whole point of 🙈.
+    if (!spoiler) {
+      await sendMatchedPageImages(chatId, results);
     }
 
     // A question counts as "successfully answered" when Gemini matched
