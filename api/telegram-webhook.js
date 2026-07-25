@@ -370,28 +370,50 @@ async function resolveBookForUser(fromUser) {
 // succeeded, whether any fallback attempts happened along the way, and
 // which questions ultimately failed — all as a single message instead of
 // one notification per Gemini call.
+// Renders one "which key/model succeeded" block for a given list of
+// generationCalls (either extraction calls or answer-generation calls —
+// see the two call sites below), so the two phases can be shown as
+// clearly separate sections in the admin report instead of one merged
+// list that doesn't say which model did what.
+function buildModelUsageLine(label, calls) {
+  const successful = calls.filter((g) => !g.failed);
+  if (successful.length === 0) return null;
+  const counts = {};
+  successful.forEach((g) => {
+    const key = `${g.keyLabel} · ${g.model}`;
+    counts[key] = (counts[key] || 0) + 1;
+  });
+  const keyLines = Object.entries(counts)
+    .map(([key, n]) => `• ${key}${n > 1 ? ` (×${n})` : ''}`)
+    .join('\n');
+  return `${label}\n${keyLines}`;
+}
+
 function buildUsageReportLines(usage) {
   const lines = [];
 
-  const successfulGen = usage.generationCalls.filter((g) => !g.failed);
-  if (successfulGen.length > 0) {
-    const counts = {};
-    successfulGen.forEach((g) => {
-      const label = `${g.keyLabel} · ${g.model}`;
-      counts[label] = (counts[label] || 0) + 1;
-    });
-    const keyLines = Object.entries(counts)
-      .map(([label, n]) => `• ${label}${n > 1 ? ` (×${n})` : ''}`)
-      .join('\n');
-    lines.push(`🔑 <b>المفتاح/الموديل اللي نجح:</b>\n${keyLines}`);
-  }
+  // Extraction (question/chapter splitting — lib/questionExtractor.js,
+  // env.GEMINI_EXTRACTION_MODEL) and generation (actual answer
+  // generation — lib/batchAnswer.js) are reported as two separate
+  // blocks so it's clear which model handled which phase, instead of
+  // one merged "المفتاح/الموديل اللي نجح" list.
+  const extractionLine = buildModelUsageLine(
+    '🧩 <b>موديل استخراج الأسئلة اللي نجح:</b>',
+    usage.extractionGenerationCalls || []
+  );
+  if (extractionLine) lines.push(extractionLine);
+
+  const generationLine = buildModelUsageLine('🔑 <b>موديل توليد الإجابات اللي نجح:</b>', usage.generationCalls);
+  if (generationLine) lines.push(generationLine);
 
   if (usage.embeddingCalls.length > 0) {
     const embedLabels = [...new Set(usage.embeddingCalls.map((e) => e.keyLabel))];
     lines.push(`🔎 <b>مفتاح الـ embedding:</b> ${embedLabels.join('، ')}`);
   }
 
-  const fallbackAttempts = usage.generationCalls.flatMap((g) => g.attempts || []);
+  const fallbackAttempts = [...(usage.extractionGenerationCalls || []), ...usage.generationCalls].flatMap(
+    (g) => g.attempts || []
+  );
   if (fallbackAttempts.length > 0) {
     lines.push(
       `⚠️ <b>حصل fallback (${fallbackAttempts.length} محاولة فشلت قبل النجاح):</b>\n${gemini.formatAttemptLog(fallbackAttempts)}`
@@ -641,7 +663,17 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
   // extractionFailures (AI question/chapter extraction falling back to
   // plain line-splitting — see lib/questionExtractor.js) is seeded in
   // here too, rather than being reported separately, for the same reason.
-  const usage = { embeddingCalls: [], generationCalls: [...extractionGenerationCalls], failures: [], extractionFailures };
+  const usage = {
+    embeddingCalls: [],
+    // Answer-generation calls (lib/batchAnswer.js) and extraction calls
+    // (lib/questionExtractor.js) are kept in separate arrays — see
+    // buildUsageReportLines — instead of merging them, so the admin
+    // report can say which model handled which phase.
+    generationCalls: [],
+    extractionGenerationCalls: [...extractionGenerationCalls],
+    failures: [],
+    extractionFailures,
+  };
   // Set once the PDF is actually generated below, so the final admin
   // report can be sent as that PDF's caption instead of a standalone
   // message — see notifyAdminsWithDocument.
