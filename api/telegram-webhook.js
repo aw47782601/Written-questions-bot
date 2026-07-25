@@ -46,6 +46,36 @@ async function notifyAdmins(text, extra = {}) {
   );
 }
 
+// Telegram document captions are hard-capped at 1024 chars — see
+// https://core.telegram.org/bots/api#senddocument. When the report fits,
+// it rides along as the PDF's caption (one message, as intended); when it
+// doesn't, sending it only as a caption would silently truncate away the
+// failure details, so the full report goes out as its own text message
+// right before the (caption-less) PDF instead of quietly losing info.
+const TELEGRAM_CAPTION_LIMIT = 1024;
+
+// Forwards a generated answers PDF to every admin with the SAME
+// consolidated report (built by buildUsageReportLines et al.) as its
+// caption, instead of the PDF going only to the user while admins get a
+// separate plain-text notification — see processBatchWithFormat.
+async function notifyAdminsWithDocument(pdfBuffer, filename, reportText, extra = {}) {
+  const fitsAsCaption = reportText.length <= TELEGRAM_CAPTION_LIMIT;
+  await Promise.all(
+    env.ADMIN_CHAT_IDS.map(async (id) => {
+      try {
+        if (fitsAsCaption) {
+          await telegram.sendDocument(id, pdfBuffer, filename, { ...extra, caption: reportText });
+        } else {
+          await telegram.sendMessage(id, reportText, extra);
+          await telegram.sendDocument(id, pdfBuffer, filename);
+        }
+      } catch (err) {
+        console.error(`notifyAdminsWithDocument failed for ${id}:`, err.message);
+      }
+    })
+  );
+}
+
 function escapeHtml(text) {
   if (!text) return '';
   return String(text)
@@ -523,7 +553,7 @@ async function handleCollectCancelButton(chatId, messageId, userId) {
 // asks the user which format they want THIS batch delivered in. The
 // actual Gemini call + delivery happens in processBatchWithFormat, once
 // they tap a button (see the ansfmt_ callback handler).
-async function handleQuestionsBatch(chatId, questions, fromUser = null) {
+async function handleQuestionsBatch(chatId, questions, fromUser = null, extractionFailures = []) {
   const { readyBooks, book } = await resolveBookForUser(fromUser);
 
   if (readyBooks.length === 0) {
@@ -551,11 +581,11 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
   // there's no one to key a pending-batch/callback flow to, so just fall
   // back to answering directly as plain text like before.
   if (!fromUser) {
-    await processBatchWithFormat(chatId, questions, book, null, 'text');
+    await processBatchWithFormat(chatId, questions, book, null, 'text', null, null, false, extractionFailures);
     return;
   }
 
-  const token = await pendingBatches.stageBatch(fromUser.id, { questions, bookId: book.id });
+  const token = await pendingBatches.stageBatch(fromUser.id, { questions, bookId: book.id, extractionFailures });
   const pdfAllowed = (await pdfAccess.getAccessibleDesigns(fromUser.id, isAdmin)).length > 0;
   const countLine =
     questions.length > 1
@@ -571,7 +601,7 @@ async function handleQuestionsBatch(chatId, questions, fromUser = null) {
 // if it includes PDF, a design + color) for this specific batch — or
 // immediately with the defaults, for the fromUser === null edge case (see
 // handleQuestionsBatch).
-async function processBatchWithFormat(chatId, questions, book, fromUser, format, designId, colorKey, spoiler = false) {
+async function processBatchWithFormat(chatId, questions, book, fromUser, format, designId, colorKey, spoiler = false, extractionFailures = []) {
   const userLabel = fromUser
     ? `${escapeHtml(fromUser.first_name || '')}${fromUser.username ? ' (@' + escapeHtml(fromUser.username) + ')' : ''} — <code>${fromUser.id}</code>`
     : `<code>${chatId}</code>`;
@@ -579,7 +609,15 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
   // Collects "which key/model was used" + "which questions ultimately
   // failed" across every Gemini call made for this request, so exactly
   // ONE admin report gets sent at the end instead of one per call.
-  const usage = { embeddingCalls: [], generationCalls: [], failures: [] };
+  // extractionFailures (AI question/chapter extraction falling back to
+  // plain line-splitting — see lib/questionExtractor.js) is seeded in
+  // here too, rather than being reported separately, for the same reason.
+  const usage = { embeddingCalls: [], generationCalls: [], failures: [], extractionFailures };
+  // Set once the PDF is actually generated below, so the final admin
+  // report can be sent as that PDF's caption instead of a standalone
+  // message — see notifyAdminsWithDocument.
+  let generatedPdfBuffer = null;
+  let generatedPdfFilename = null;
 
   try {
     let extraKeys = [];
@@ -631,10 +669,13 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
             bookName: book.name,
             colorKey: colorKey || pdfColors.DEFAULT_PDF_COLOR,
           });
-          await telegram.sendDocument(chatId, pdfBuffer, `answers_${Date.now()}.pdf`, {
+          const pdfFilename = `answers_${Date.now()}.pdf`;
+          await telegram.sendDocument(chatId, pdfBuffer, pdfFilename, {
             caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"`,
           });
           pdfSent = true;
+          generatedPdfBuffer = pdfBuffer;
+          generatedPdfFilename = pdfFilename;
         } catch (pdfErr) {
           console.error('PDF generation/send failed:', pdfErr);
           await telegram.sendMessage(chatId, '⚠️ حصل خطأ أثناء تجهيز ملف الـ PDF، بس الإجابات وصلتك كنص لو كان مطلوب.');
@@ -678,7 +719,15 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
       `✅ <b>${success}/${total}</b> سؤال اتجاوب عليه من الكتاب.`,
       ...buildUsageReportLines(usage),
     ];
-    await notifyAdmins(reportLines.join('\n\n'), { parse_mode: 'HTML' });
+    const reportText = reportLines.join('\n\n');
+    if (generatedPdfBuffer) {
+      // PDF was produced for this batch — forward it to admins with this
+      // same report as its caption instead of a separate plain-text
+      // notification.
+      await notifyAdminsWithDocument(generatedPdfBuffer, generatedPdfFilename, reportText, { parse_mode: 'HTML' });
+    } else {
+      await notifyAdmins(reportText, { parse_mode: 'HTML' });
+    }
   } catch (err) {
     console.error('Answering failed:', err);
     if (err instanceof DailyLimitReachedError) {
@@ -2261,7 +2310,17 @@ async function handleCallbackQuery(cb) {
         messageId,
         `⏳ تمام، جاري تجهيز الإجابة بصيغة: ${FORMAT_LABELS[finalPending.format]} (${preset.emoji} ${preset.label})...`
       );
-      await processBatchWithFormat(chatId, finalPending.questions, book, cb.from, finalPending.format, finalPending.designId, colorKey);
+      await processBatchWithFormat(
+        chatId,
+        finalPending.questions,
+        book,
+        cb.from,
+        finalPending.format,
+        finalPending.designId,
+        colorKey,
+        false,
+        finalPending.extractionFailures
+      );
       return;
     }
 
@@ -2334,7 +2393,8 @@ async function handleCallbackQuery(cb) {
       pending.format,
       pending.designId,
       pending.colorKey,
-      spoiler
+      spoiler,
+      pending.extractionFailures
     );
     return;
   }
@@ -2641,10 +2701,11 @@ module.exports = async (req, res) => {
       } else if (isPdf || isText) {
         // Anyone else sending a document = a batch of questions.
         const buffer = await telegram.downloadFileBuffer(message.document.file_id);
+        const extractionFailures = [];
         const questions = isPdf
-          ? await extractQuestionsFromPdfBuffer(buffer)
-          : await extractQuestionsFromPlainTextBuffer(buffer);
-        await handleQuestionsBatch(chatId, questions, fromUser);
+          ? await extractQuestionsFromPdfBuffer(buffer, extractionFailures)
+          : await extractQuestionsFromPlainTextBuffer(buffer, extractionFailures);
+        await handleQuestionsBatch(chatId, questions, fromUser, extractionFailures);
       } else {
         await telegram.sendMessage(chatId, '⚠️ الصيغة دي مش مدعومة، ابعت PDF أو TXT.');
       }
