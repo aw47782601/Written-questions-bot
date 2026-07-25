@@ -352,6 +352,28 @@ function buildUsageReportLines(usage) {
     lines.push(`🟠 <b>أسئلة فشلت نهائياً بعد كل المحاولات (${usage.failures.length}):</b>\n${failLines}${more}`);
   }
 
+  // AI question/chapter extraction (lib/questionExtractor.js) falling back
+  // to plain line-splitting for one or more chunks — collected at
+  // extraction time (well before this report is built, see
+  // lib/pendingBatches.js's extractionFailures field) and folded in here
+  // instead of being its own separate admin message.
+  if (usage.extractionFailures && usage.extractionFailures.length > 0) {
+    const shown = usage.extractionFailures.slice(0, 5);
+    const failLines = shown
+      .map((f, i) => {
+        const trimmed = f.error.length > 300 ? `${f.error.slice(0, 300)}…` : f.error;
+        return `${i + 1}. الموديل: <code>${escapeHtml(f.model)}</code>\nالسبب: <code>${escapeHtml(trimmed)}</code>`;
+      })
+      .join('\n\n');
+    const more =
+      usage.extractionFailures.length > shown.length
+        ? `\n\n(+${usage.extractionFailures.length - shown.length} فشل تاني)`
+        : '';
+    lines.push(
+      `⚠️ <b>تحليل الأسئلة بالذكاء الاصطناعي فشل لـ ${usage.extractionFailures.length} جزء واستخدم تقسيم الأسطر بدلاً منه (من غير تمييز فصول ولا دمج الأسطر المقسومة):</b>\n${failLines}${more}`
+    );
+  }
+
   return lines;
 }
 
@@ -385,11 +407,11 @@ function buildCollectKeyboard() {
   };
 }
 
-function buildCollectStatusText(count) {
+function buildCollectStatusText(messageCount) {
   return (
     `📝 جاري تجميع الأسئلة...\n\n` +
     `دوس *✅ ابدأ التحليل* لما تخلص عشان يبدأ تحليل الأسئلة بالذكاء الاصطناعي وتستلم كل الإجابات مع بعض (PDF واحد لو اخترت PDF)، أو *❌ إلغاء* لو عايز تلغي.\n\n` +
-    `🔢 تقريباً *${count}* سؤال اتجمع لحد دلوقتي (العدد الدقيق والتحليل الفعلي بيحصلوا بعد ما تدوس ابدأ التحليل)`
+    `📨 عدد الرسايل اللي استلمتها لحد دلوقتي: *${messageCount}* (هيظهر عدد الأسئلة الحقيقي بعد التحليل بالذكاء الاصطناعي لما تدوس ابدأ التحليل)`
   );
 }
 
@@ -399,7 +421,7 @@ async function handleStartCollectCommand(chatId, userId) {
     const note = existing.messageId
       ? 'كمّل ابعت أسئلتك، أو دوس على الأزرار في الرسالة اللي فيها العداد.'
       : 'كمّل ابعتلي أسئلتك.';
-    await telegram.sendMessage(chatId, `📝 وضع التجميع شغال بالفعل (${existing.lineCount} سؤال تقريباً لحد دلوقتي).\n${note}`);
+    await telegram.sendMessage(chatId, `📝 وضع التجميع شغال بالفعل (${existing.rawTexts.length} رسالة اتبعتت لحد دلوقتي).\n${note}`);
     return;
   }
   // Just the plain notice for now — no count, no buttons, since nothing
@@ -420,15 +442,16 @@ async function handleCollectMessage(chatId, userId, text) {
   const before = await collectSession.getSession(userId);
   if (!before) return false;
 
-  // No AI call here — this only buffers the raw text and bumps a rough,
-  // regex-free line-count estimate for the live status message. The real
-  // analysis (Gemini extraction + chapter tagging) runs exactly once, on
-  // the full merged text, in handleCollectStartButton below.
+  // No AI call here — this only buffers the raw text. The real analysis
+  // (Gemini extraction + chapter tagging) runs exactly once, on the full
+  // merged text, in handleCollectStartButton below.
+  if (!text || !text.trim()) return true; // nothing meaningful to add
+
   const updated = await collectSession.addText(userId, text);
-  if (updated.lineCount === before.lineCount) return true; // nothing new counted from this message
+  const messageCount = updated.rawTexts.length;
 
   if (!updated.messageId) {
-    const sent = await telegram.sendMessage(chatId, buildCollectStatusText(updated.lineCount), {
+    const sent = await telegram.sendMessage(chatId, buildCollectStatusText(messageCount), {
       parse_mode: 'Markdown',
       reply_markup: buildCollectKeyboard(),
     });
@@ -438,7 +461,7 @@ async function handleCollectMessage(chatId, userId, text) {
     await telegram.editMessageText(
       updated.chatId,
       updated.messageId,
-      buildCollectStatusText(updated.lineCount),
+      buildCollectStatusText(messageCount),
       { parse_mode: 'Markdown', reply_markup: buildCollectKeyboard() }
     );
   }
@@ -468,14 +491,15 @@ async function handleCollectStartButton(chatId, messageId, fromUser) {
   await telegram.editMessageText(chatId, messageId, '🧠 جاري تحليل الأسئلة بالذكاء الاصطناعي...', {
     reply_markup: { inline_keyboard: [] },
   });
-  const items = await extractQuestionsFromText(session.text);
+  const extractionFailures = [];
+  const items = await extractQuestionsFromText(session.text, extractionFailures);
   if (items.length === 0) {
     await telegram.sendMessage(chatId, '⚠️ مقدرتش ألاقي أي أسئلة في اللي بعتهولي.');
     return;
   }
 
   await telegram.sendMessage(chatId, `✅ جاري تجهيز الإجابات لـ ${items.length} سؤال...`);
-  await handleQuestionsBatch(chatId, items, fromUser);
+  await handleQuestionsBatch(chatId, items, fromUser, extractionFailures);
 }
 
 // "❌ إلغاء" button — discards the session and clears the buttons.
