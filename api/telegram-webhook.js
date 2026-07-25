@@ -6,6 +6,7 @@ const { keywordSearchChunks, debugRetrieve } = require('../lib/rag');
 const {
   extractQuestionsFromPdfBuffer,
   extractQuestionsFromPlainTextBuffer,
+  extractQuestionsFromText,
 } = require('../lib/questionExtractor');
 const { answerQuestions } = require('../lib/batchAnswer');
 const collectSession = require('../lib/collectSession');
@@ -387,8 +388,8 @@ function buildCollectKeyboard() {
 function buildCollectStatusText(count) {
   return (
     `📝 جاري تجميع الأسئلة...\n\n` +
-    `دوس *✅ ابدأ التحليل* لما تخلص عشان تستلم كل الإجابات مع بعض (PDF واحد لو اخترت PDF)، أو *❌ إلغاء* لو عايز تلغي.\n\n` +
-    `🔢 عدد الأسئلة اللي اتجمعت لحد دلوقتي: *${count}*`
+    `دوس *✅ ابدأ التحليل* لما تخلص عشان يبدأ تحليل الأسئلة بالذكاء الاصطناعي وتستلم كل الإجابات مع بعض (PDF واحد لو اخترت PDF)، أو *❌ إلغاء* لو عايز تلغي.\n\n` +
+    `🔢 تقريباً *${count}* سؤال اتجمع لحد دلوقتي (العدد الدقيق والتحليل الفعلي بيحصلوا بعد ما تدوس ابدأ التحليل)`
   );
 }
 
@@ -398,7 +399,7 @@ async function handleStartCollectCommand(chatId, userId) {
     const note = existing.messageId
       ? 'كمّل ابعت أسئلتك، أو دوس على الأزرار في الرسالة اللي فيها العداد.'
       : 'كمّل ابعتلي أسئلتك.';
-    await telegram.sendMessage(chatId, `📝 وضع التجميع شغال بالفعل (${existing.questions.length} سؤال لحد دلوقتي).\n${note}`);
+    await telegram.sendMessage(chatId, `📝 وضع التجميع شغال بالفعل (${existing.lineCount} سؤال تقريباً لحد دلوقتي).\n${note}`);
     return;
   }
   // Just the plain notice for now — no count, no buttons, since nothing
@@ -419,11 +420,15 @@ async function handleCollectMessage(chatId, userId, text) {
   const before = await collectSession.getSession(userId);
   if (!before) return false;
 
+  // No AI call here — this only buffers the raw text and bumps a rough,
+  // regex-free line-count estimate for the live status message. The real
+  // analysis (Gemini extraction + chapter tagging) runs exactly once, on
+  // the full merged text, in handleCollectStartButton below.
   const updated = await collectSession.addText(userId, text);
-  if (updated.questions.length === before.questions.length) return true; // nothing new extracted from this message
+  if (updated.lineCount === before.lineCount) return true; // nothing new counted from this message
 
   if (!updated.messageId) {
-    const sent = await telegram.sendMessage(chatId, buildCollectStatusText(updated.questions.length), {
+    const sent = await telegram.sendMessage(chatId, buildCollectStatusText(updated.lineCount), {
       parse_mode: 'Markdown',
       reply_markup: buildCollectKeyboard(),
     });
@@ -433,7 +438,7 @@ async function handleCollectMessage(chatId, userId, text) {
     await telegram.editMessageText(
       updated.chatId,
       updated.messageId,
-      buildCollectStatusText(updated.questions.length),
+      buildCollectStatusText(updated.lineCount),
       { parse_mode: 'Markdown', reply_markup: buildCollectKeyboard() }
     );
   }
@@ -446,19 +451,31 @@ async function handleCollectMessage(chatId, userId, text) {
 // rather than left sitting there as if still collecting.
 async function handleCollectStartButton(chatId, messageId, fromUser) {
   const session = await collectSession.endSession(fromUser.id);
-  if (!session || session.questions.length === 0) {
+  if (!session || !session.text || !session.text.trim()) {
     await telegram.editMessageText(chatId, messageId, '⚠️ مفيش أسئلة اتجمعت. ابعت /text وبعدين ابعتلي الأسئلة.', {
       reply_markup: { inline_keyboard: [] },
     });
     return;
   }
-  await telegram.editMessageText(
-    chatId,
-    messageId,
-    `✅ جاري تجهيز الإجابات لـ ${session.questions.length} سؤال...`,
-    { reply_markup: { inline_keyboard: [] } }
-  );
-  await handleQuestionsBatch(chatId, session.questions, fromUser);
+
+  // THE actual analysis step: this is the only place the AI extraction
+  // (Gemini — see lib/questionExtractor.js) runs for /text collect mode,
+  // and it only runs now, after the user tapped "✅ ابدأ التحليل", on the
+  // full merged text from every message they sent while collecting. It
+  // also tags each question with the chapter/section title (if any) that
+  // preceded it, which flows through to the PDF as a header before that
+  // chapter's questions (see lib/pdfGenerator.js).
+  await telegram.editMessageText(chatId, messageId, '🧠 جاري تحليل الأسئلة بالذكاء الاصطناعي...', {
+    reply_markup: { inline_keyboard: [] },
+  });
+  const items = await extractQuestionsFromText(session.text);
+  if (items.length === 0) {
+    await telegram.sendMessage(chatId, '⚠️ مقدرتش ألاقي أي أسئلة في اللي بعتهولي.');
+    return;
+  }
+
+  await telegram.sendMessage(chatId, `✅ جاري تجهيز الإجابات لـ ${items.length} سؤال...`);
+  await handleQuestionsBatch(chatId, items, fromUser);
 }
 
 // "❌ إلغاء" button — discards the session and clears the buttons.
