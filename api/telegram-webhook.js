@@ -286,11 +286,14 @@ function buildDesignKeyboard(token, accessibleDesigns) {
 }
 
 // Shown after the user picks a design, so they choose a color for THIS
-// PDF only (nothing persisted — see the block comment above).
+// PDF only (nothing persisted — see the block comment above). The last
+// button lets them type their own hex code instead of a preset — see the
+// ansclrcustom_ callback handler.
 function buildColorKeyboard(token) {
   const buttons = pdfColors.listPdfColors().map((c) => [
     { text: `${c.emoji} ${c.label}`, callback_data: `ansclr_${c.key}_${token}` },
   ]);
+  buttons.push([{ text: '🎨 لون بالكود (اكتب الكود)', callback_data: `ansclrcustom_${token}` }]);
   return { inline_keyboard: buttons };
 }
 
@@ -1959,6 +1962,81 @@ async function tryHandleAddKeyPaste(chatId, userId, text) {
 // 🔀 Callback query (inline button) router
 // =========================================================
 
+// Shared tail of the color-selection step — used both when the user taps
+// a preset color button (ansclr_ in handleCallbackQuery below) and when
+// they finish typing a custom hex code (ansclrcustom_ -> the plain-text
+// handler in module.exports further down). Validates the staged batch is
+// still alive, re-checks design access, stores the final colorKey (a
+// preset key OR a raw "#RRGGBB" — see lib/pdfColors.js), and either
+// answers right away ('pdf' format, which has no text/spoiler step) or
+// moves on to the spoiler question.
+// respond.error(text): something's wrong with the batch/access — an alert
+//   popup for the button flow, a plain message for the typed-code flow.
+// respond.status(text, extra): the final "⏳ جاري تجهيز..." /
+//   "🙈 تحب تبقى مشوشة؟" step — acks + edits the existing message for the
+//   button flow, sends a new message for the typed-code flow.
+async function finishColorSelection(chatId, userId, fromUserObj, token, colorKey, respond) {
+  const peeked = await pendingBatches.peekBatch(userId, token);
+  if (!peeked || !peeked.format || !peeked.designId) {
+    await respond.error('⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.');
+    return;
+  }
+
+  // Re-check design access in case it was revoked between the design
+  // button being tapped and the color being chosen.
+  const accessibleAtColorStep = await pdfAccess.getAccessibleDesigns(userId, isAdmin);
+  if (!accessibleAtColorStep.some((d) => d.id === peeked.designId)) {
+    await respond.error('⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.');
+    return;
+  }
+
+  const book = await books.getBook(peeked.bookId);
+  if (!book || book.status !== 'ready') {
+    await respond.error('⚠️ الكتاب ده مبقاش متاح. ابعت الأسئلة تاني.');
+    return;
+  }
+
+  const updatedWithColor = await pendingBatches.updateBatch(userId, token, { colorKey });
+  if (!updatedWithColor) {
+    await respond.error('⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.');
+    return;
+  }
+
+  const { emoji, label } = pdfColors.describeColor(colorKey);
+
+  // Spoiler only ever affects the TEXT reply — a pure 'pdf' pick has no
+  // text component, so there's nothing to ask about; answer right away
+  // instead of showing a pointless spoiler step. 'both' still asks,
+  // since it does include a text reply.
+  if (peeked.format === 'pdf') {
+    const finalPending = await pendingBatches.takeBatch(userId, token);
+    if (!finalPending) {
+      await respond.error('⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.');
+      return;
+    }
+    await respond.status(
+      `⏳ تمام، جاري تجهيز الإجابة بصيغة: ${FORMAT_LABELS[finalPending.format]} (${emoji} ${label})...`
+    );
+    await processBatchWithFormat(
+      chatId,
+      finalPending.questions,
+      book,
+      fromUserObj,
+      finalPending.format,
+      finalPending.designId,
+      colorKey,
+      false,
+      finalPending.extractionFailures,
+      finalPending.extractionGenerationCalls
+    );
+    return;
+  }
+
+  await respond.status(`🙈 تحب الإجابة تبقى مشوشة (تتفتح بالضغط) ولا عادية؟`, {
+    reply_markup: buildSpoilerKeyboard(token),
+  });
+}
+
 async function handleCallbackQuery(cb) {
   const chatId = cb.message.chat.id;
   const messageId = cb.message.message_id;
@@ -2260,14 +2338,12 @@ async function handleCallbackQuery(cb) {
     return;
   }
 
-  // 🎨 Per-batch PDF color choice — data is "ansclr_<colorKey>_<token>".
-  // After ansdsg_ picked a design: stores the color on the still-staged
-  // batch. Format 'both' moves on to the 🙈 نص مشوش spoiler question (see
-  // buildSpoilerKeyboard / ansspl_ below), since spoiler only ever affects
-  // the text reply; format 'pdf' has no text reply, so it skips straight
-  // to answering. Nothing here is persisted — the next batch asks again
-  // from scratch.
-  if (data.startsWith('ansclr_')) {
+// 🎨 Per-batch PDF color choice — data is "ansclr_<colorKey>_<token>".
+// After ansdsg_ picked a design: stores the color on the still-staged
+// batch and moves on via finishColorSelection (defined above, before
+// handleCallbackQuery). Nothing here is persisted — the next batch asks
+// again from scratch.
+if (data.startsWith('ansclr_')) {
     const rest = data.slice('ansclr_'.length);
     const sepIdx = rest.indexOf('_');
     const colorKey = sepIdx === -1 ? rest : rest.slice(0, sepIdx);
@@ -2278,6 +2354,26 @@ async function handleCallbackQuery(cb) {
       return;
     }
 
+    const { emoji, label } = pdfColors.describeColor(colorKey);
+    await finishColorSelection(chatId, userId, cb.from, token, colorKey, {
+      error: (text) => telegram.answerCallbackQuery(cb.id, { text, show_alert: true }),
+      status: async (text, extra) => {
+        await telegram.answerCallbackQuery(cb.id, { text: `✅ ${emoji} ${label}` });
+        await telegram.editMessageText(chatId, messageId, text, extra);
+      },
+    });
+    return;
+  }
+
+  // 🎨 Custom PDF color by hex code — data is "ansclrcustom_<token>", the
+  // last button in buildColorKeyboard. Doesn't pick a color itself — just
+  // remembers which batch is waiting for a typed hex code next, so the
+  // very next text message from this user (see the pendingcustomcolor_
+  // check in the main message handler below) is read as the color code
+  // instead of routed as a new question/command.
+  if (data.startsWith('ansclrcustom_')) {
+    const token = data.slice('ansclrcustom_'.length);
+
     const peeked = await pendingBatches.peekBatch(userId, token);
     if (!peeked || !peeked.format || !peeked.designId) {
       await telegram.answerCallbackQuery(cb.id, {
@@ -2287,76 +2383,13 @@ async function handleCallbackQuery(cb) {
       return;
     }
 
-    // Re-check design access in case it was revoked between the design
-    // button being tapped and the color button being tapped.
-    const accessibleAtColorStep = await pdfAccess.getAccessibleDesigns(userId, isAdmin);
-    if (!accessibleAtColorStep.some((d) => d.id === peeked.designId)) {
-      await telegram.answerCallbackQuery(cb.id, {
-        text: '⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.',
-        show_alert: true,
-      });
-      return;
-    }
-
-    const book = await books.getBook(peeked.bookId);
-    if (!book || book.status !== 'ready') {
-      await telegram.answerCallbackQuery(cb.id, {
-        text: '⚠️ الكتاب ده مبقاش متاح. ابعت الأسئلة تاني.',
-        show_alert: true,
-      });
-      await telegram.editMessageText(chatId, messageId, '⚠️ الكتاب ده مبقاش متاح. ابعت الأسئلة تاني.');
-      return;
-    }
-
-    const updatedWithColor = await pendingBatches.updateBatch(userId, token, { colorKey });
-    if (!updatedWithColor) {
-      await telegram.answerCallbackQuery(cb.id, {
-        text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
-        show_alert: true,
-      });
-      return;
-    }
-
-    const preset = pdfColors.PDF_COLOR_PRESETS[colorKey];
-
-    // Spoiler only ever affects the TEXT reply — a pure 'pdf' pick has no
-    // text component, so there's nothing to ask about; answer right away
-    // instead of showing a pointless spoiler step. 'both' still asks,
-    // since it does include a text reply.
-    if (peeked.format === 'pdf') {
-      const finalPending = await pendingBatches.takeBatch(userId, token);
-      if (!finalPending) {
-        await telegram.answerCallbackQuery(cb.id, {
-          text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
-          show_alert: true,
-        });
-        return;
-      }
-      await telegram.answerCallbackQuery(cb.id, { text: `✅ ${preset.emoji} ${preset.label}` });
-      await telegram.editMessageText(
-        chatId,
-        messageId,
-        `⏳ تمام، جاري تجهيز الإجابة بصيغة: ${FORMAT_LABELS[finalPending.format]} (${preset.emoji} ${preset.label})...`
-      );
-      await processBatchWithFormat(
-        chatId,
-        finalPending.questions,
-        book,
-        cb.from,
-        finalPending.format,
-        finalPending.designId,
-        colorKey,
-        false,
-        finalPending.extractionFailures,
-        finalPending.extractionGenerationCalls
-      );
-      return;
-    }
-
-    await telegram.answerCallbackQuery(cb.id, { text: `✅ ${preset.emoji} ${preset.label}` });
-    await telegram.editMessageText(chatId, messageId, `🙈 تحب الإجابة تبقى مشوشة (تتفتح بالضغط) ولا عادية؟`, {
-      reply_markup: buildSpoilerKeyboard(token),
-    });
+    await botConfig.setConfig(`pendingcustomcolor_${userId}`, { token, createdAt: Date.now() });
+    await telegram.answerCallbackQuery(cb.id);
+    await telegram.editMessageText(
+      chatId,
+      messageId,
+      '🎨 ابعت كود اللون اللي عايزه (مثال: #ED6F60 أو ED6F60).'
+    );
     return;
   }
 
@@ -2742,6 +2775,37 @@ module.exports = async (req, res) => {
       }
     } else if (message.text) {
       const text = message.text.trim();
+
+      // 🎨 Mid custom-PDF-color entry (see the ansclrcustom_ callback
+      // above) — the very next text message from this user is read as
+      // their hex color code instead of any other command/question
+      // routing below. A bad code re-prompts and keeps waiting; a good
+      // one finishes the color step via the same finishColorSelection
+      // tail the preset-button flow uses.
+      const pendingColor = await botConfig.getConfig(`pendingcustomcolor_${fromUser.id}`);
+      if (pendingColor) {
+        const stale = Date.now() - (pendingColor.createdAt || 0) > 10 * 60 * 1000;
+        await botConfig.deleteConfig(`pendingcustomcolor_${fromUser.id}`);
+        if (stale) {
+          await telegram.sendMessage(chatId, '⚠️ الوقت خلص. ابعت الأسئلة تاني.');
+        } else if (!pdfColors.isHexColor(text)) {
+          // Keep waiting — restore the pending state and ask again rather
+          // than dropping the flow on one bad input.
+          await botConfig.setConfig(`pendingcustomcolor_${fromUser.id}`, pendingColor);
+          await telegram.sendMessage(
+            chatId,
+            '⚠️ كود لون غير صحيح. ابعت كود بصيغة #RRGGBB زي #ED6F60.'
+          );
+        } else {
+          const hex = pdfColors.normalizeHex(text);
+          await finishColorSelection(chatId, fromUser.id, fromUser, pendingColor.token, hex, {
+            error: (t) => telegram.sendMessage(chatId, t),
+            status: (t, extra) => telegram.sendMessage(chatId, t, extra),
+          });
+        }
+        res.status(200).json({ ok: true });
+        return;
+      }
 
       if (text.startsWith('/start')) {
         const welcomeCfg = await botConfig.getConfig('welcome_msg');
