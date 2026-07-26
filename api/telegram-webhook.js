@@ -17,6 +17,7 @@ const { DailyLimitReachedError } = require('../lib/usageTracker');
 const botConfig = require('../lib/botConfig');
 const users = require('../lib/users');
 const pendingBatches = require('../lib/pendingBatches');
+const answeredBatches = require('../lib/answeredBatches');
 const userApiKeys = require('../lib/userApiKeys');
 const telegramUpdates = require('../lib/telegramUpdates');
 const cairoTime = require('../lib/cairoTime');
@@ -591,6 +592,181 @@ async function handleCollectCancelButton(chatId, messageId, userId) {
   });
 }
 
+// Sends the results in the requested format (text/pdf/both, honoring
+// spoiler mode) plus any matched page images — shared by the initial
+// delivery (processBatchWithFormat below) AND by finalizeRetryOrReword
+// after a 🔁 retry / ✏️ reword merge, so both paths render/send exactly
+// the same way instead of duplicating this logic.
+// Returns { pdfSent, generatedPdfBuffer, generatedPdfFilename, wantsPdf }
+// so the caller can build its own admin report/caption around it.
+async function deliverResults(chatId, results, book, fromUser, format, designId, colorKey, spoiler) {
+  const wantsText = format === 'text' || format === 'both';
+  const wantsPdf = format === 'pdf' || format === 'both';
+
+  if (wantsText) {
+    if (spoiler) {
+      await sendSpoilerResults(chatId, results);
+    } else {
+      await telegram.sendLongMessage(chatId, formatResults(results));
+    }
+  }
+
+  let pdfSent = false;
+  let generatedPdfBuffer = null;
+  let generatedPdfFilename = null;
+  if (wantsPdf) {
+    const effectiveDesignId = designId || pdfDesigns.DEFAULT_DESIGN_ID;
+    const pdfAllowed = fromUser ? await pdfAccess.isDesignAllowed(effectiveDesignId, fromUser.id, isAdmin) : true;
+    if (!pdfAllowed) {
+      // Access was revoked between the design/color buttons being shown
+      // and this batch actually running — fall back to text so the
+      // user isn't left with nothing.
+      await telegram.sendMessage(chatId, '⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.');
+      if (!wantsText) {
+        if (spoiler) {
+          await sendSpoilerResults(chatId, results);
+        } else {
+          await telegram.sendLongMessage(chatId, formatResults(results));
+        }
+      }
+    } else {
+      try {
+        // Spoiler mode never applies to the PDF — only the text reply
+        // gets the 🙈 spoiler treatment (see sendSpoilerResults above);
+        // the PDF is always rendered as plain, fully visible answers.
+        const pdfBuffer = await pdfDesigns.renderPdf(effectiveDesignId, results, {
+          title: 'Question Answers',
+          bookName: book.name,
+          colorKey: colorKey || pdfColors.DEFAULT_PDF_COLOR,
+        });
+        const pdfFilename = `answers_${Date.now()}.pdf`;
+        await telegram.sendDocument(chatId, pdfBuffer, pdfFilename, {
+          caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"`,
+        });
+        pdfSent = true;
+        generatedPdfBuffer = pdfBuffer;
+        generatedPdfFilename = pdfFilename;
+      } catch (pdfErr) {
+        console.error('PDF generation/send failed:', pdfErr);
+        await telegram.sendMessage(chatId, '⚠️ حصل خطأ أثناء تجهيز ملف الـ PDF، بس الإجابات وصلتك كنص لو كان مطلوب.');
+        if (!wantsText) {
+          // PDF was the only requested format and it failed — make sure
+          // the user isn't left with nothing.
+          if (spoiler) {
+            await sendSpoilerResults(chatId, results);
+          } else {
+            await telegram.sendLongMessage(chatId, formatResults(results));
+          }
+        }
+      }
+    }
+  }
+
+  // Follow up with the actual page image(s) for any answer whose
+  // evidence came from an image chunk (diagram/figure/table that had
+  // no usable extractable text) — see sendMatchedPageImages above.
+  // Sent regardless of which format (text/pdf/both) was chosen, since
+  // it's the only way this evidence reaches the user at all — EXCEPT
+  // in spoiler mode, where sending the page image unblurred would
+  // hand over the answer anyway and defeat the whole point of 🙈.
+  if (!spoiler) {
+    await sendMatchedPageImages(chatId, results);
+  }
+
+  return { pdfSent, generatedPdfBuffer, generatedPdfFilename, wantsPdf };
+}
+
+// 🔁✏️ Retry-failed / reword-a-question support ----------------------------
+// After delivering a batch's results, we stage the FINAL result array in
+// lib/answeredBatches.js and offer two follow-up actions — both re-answer
+// only a SMALL subset of the original batch (not all of it), so retrying
+// 2-3 failed/unclear questions out of 100, or clarifying one confusing
+// question's wording, doesn't re-consume quota for the other 97+:
+//   🔁 إعادة محاولة  — re-runs every question that came back with no page
+//      match (page === null, including the "مش واضحة" fallback) or an
+//      outright error, using the SAME wording.
+//   ✏️ تعديل/توضيح سؤال — the user replies with "<رقم>: <صياغة جديدة>"
+//      (one per line) for any question number(s) from what they were
+//      just sent, and only those get re-answered with the new wording.
+// Either path merges the re-answered subset back into the full results
+// array IN PLACE (no reordering), then redelivers the complete, updated
+// set — so the user always gets one coherent full reply/PDF, not a
+// separate mini-answer for just the retried/reworded items.
+function buildRetryRewordKeyboard(token, failedCount) {
+  const rows = [];
+  if (failedCount > 0) {
+    rows.push([
+      { text: `🔁 إعادة محاولة الأسئلة اللي مالحقتش (${failedCount})`, callback_data: `ansretry_${token}` },
+    ]);
+  }
+  rows.push([{ text: '✏️ توضيح/تعديل صياغة سؤال', callback_data: `ansreword_${token}` }]);
+  return { inline_keyboard: rows };
+}
+
+// Stages the just-delivered results and shows the follow-up buttons.
+// No-op if there's no fromUser to key the staged batch to (the same edge
+// case handleQuestionsBatch's fromUser === null path already skips the
+// per-batch format prompt for).
+async function offerRetryReword(chatId, fromUser, book, results, format, designId, colorKey, spoiler) {
+  if (!fromUser) return;
+  const failedCount = results.filter((r) => r.isError || r.page === null).length;
+  const token = await answeredBatches.saveBatch(fromUser.id, {
+    bookId: book.id,
+    bookName: book.name,
+    format,
+    designId,
+    colorKey,
+    spoiler,
+    results,
+  });
+  const note =
+    failedCount > 0
+      ? `🛠️ ${failedCount} سؤال لسه محتاج توضيح أو معندوش إجابة واضحة. تقدر تعيد المحاولة أو توضّح صياغة أي سؤال من غير ما تبعت الـ ${results.length} سؤال تاني:`
+      : `🛠️ لو حابب توضّح صياغة أي سؤال عشان تاخد إجابة أدق، من غير ما تبعت الأسئلة تاني:`;
+  await telegram.sendMessage(chatId, note, { reply_markup: buildRetryRewordKeyboard(token, failedCount) });
+}
+
+// Shared tail for BOTH the 🔁 retry callback and the ✏️ reword text
+// handler: redelivers the merged full result set in the batch's original
+// format/design/color/spoiler settings, sends the (separate) consolidated
+// admin report for just this follow-up action, then re-stages the updated
+// results so the buttons can be used again (e.g. reword one question, then
+// later retry/reword another).
+async function finalizeRetryOrReword(chatId, fromUser, book, results, format, designId, colorKey, spoiler, usage, reportTitle) {
+  const { pdfSent, generatedPdfBuffer, generatedPdfFilename, wantsPdf } = await deliverResults(
+    chatId,
+    results,
+    book,
+    fromUser,
+    format,
+    designId,
+    colorKey,
+    spoiler
+  );
+
+  const total = results.length;
+  const success = results.filter((r) => !r.isError && r.page !== null).length;
+  const userLabel = fromUser
+    ? `${escapeHtml(fromUser.first_name || '')}${fromUser.username ? ' (@' + escapeHtml(fromUser.username) + ')' : ''} — <code>${fromUser.id}</code>`
+    : `<code>${chatId}</code>`;
+  const formatLine = `📨 <b>صيغة الاستلام:</b> ${FORMAT_LABELS[format]}${spoiler ? ' 🙈 (نص مشوش)' : ''}${wantsPdf && !pdfSent ? ' (⚠️ فشل إرسال الـ PDF)' : ''}`;
+  const reportLines = [
+    reportTitle,
+    `👤 ${userLabel}`,
+    `📖 ${escapeHtml(book.name)}`,
+    formatLine,
+    `✅ <b>${success}/${total}</b> سؤال اتجاوب عليه من الكتاب (بعد التحديث).`,
+    ...buildUsageReportLines(usage),
+  ];
+  if (generatedPdfBuffer) {
+    await notifyAdminsWithDocument(generatedPdfBuffer, generatedPdfFilename, reportLines, { parse_mode: 'HTML' });
+  } else {
+    await notifyAdmins(reportLines.join('\n\n'), { parse_mode: 'HTML' });
+  }
+
+  await offerRetryReword(chatId, fromUser, book, results, format, designId, colorKey, spoiler);
+}
+
 // fromUser (optional): the Telegram `from` object of whoever sent the
 // questions. When provided: (1) their own validated Gemini keys (if they
 // have MIN_USER_KEYS_FOR_BOOST or more) are pooled in for this request
@@ -694,76 +870,18 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
     // reorderUnansweredLast above).
     const results = reorderUnansweredLast(rawResults);
 
-    const wantsText = format === 'text' || format === 'both';
-    const wantsPdf = format === 'pdf' || format === 'both';
-
-    if (wantsText) {
-      if (spoiler) {
-        await sendSpoilerResults(chatId, results);
-      } else {
-        await telegram.sendLongMessage(chatId, formatResults(results));
-      }
-    }
-    let pdfSent = false;
-    if (wantsPdf) {
-      const effectiveDesignId = designId || pdfDesigns.DEFAULT_DESIGN_ID;
-      const pdfAllowed = fromUser ? await pdfAccess.isDesignAllowed(effectiveDesignId, fromUser.id, isAdmin) : true;
-      if (!pdfAllowed) {
-        // Access was revoked between the design/color buttons being shown
-        // and this batch actually running — fall back to text so the
-        // user isn't left with nothing.
-        await telegram.sendMessage(chatId, '⚠️ صيغة الـ PDF مش متاحة لحسابك حالياً.');
-        if (!wantsText) {
-          if (spoiler) {
-            await sendSpoilerResults(chatId, results);
-          } else {
-            await telegram.sendLongMessage(chatId, formatResults(results));
-          }
-        }
-      } else {
-        try {
-          // Spoiler mode never applies to the PDF — only the text reply
-          // gets the 🙈 spoiler treatment (see sendSpoilerResults above);
-          // the PDF is always rendered as plain, fully visible answers.
-          const pdfBuffer = await pdfDesigns.renderPdf(effectiveDesignId, results, {
-            title: 'Question Answers',
-            bookName: book.name,
-            colorKey: colorKey || pdfColors.DEFAULT_PDF_COLOR,
-          });
-          const pdfFilename = `answers_${Date.now()}.pdf`;
-          await telegram.sendDocument(chatId, pdfBuffer, pdfFilename, {
-            caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"`,
-          });
-          pdfSent = true;
-          generatedPdfBuffer = pdfBuffer;
-          generatedPdfFilename = pdfFilename;
-        } catch (pdfErr) {
-          console.error('PDF generation/send failed:', pdfErr);
-          await telegram.sendMessage(chatId, '⚠️ حصل خطأ أثناء تجهيز ملف الـ PDF، بس الإجابات وصلتك كنص لو كان مطلوب.');
-          if (!wantsText) {
-            // PDF was the only requested format and it failed — make sure
-            // the user isn't left with nothing.
-            if (spoiler) {
-              await sendSpoilerResults(chatId, results);
-            } else {
-              await telegram.sendLongMessage(chatId, formatResults(results));
-            }
-          }
-        }
-      }
-    }
-
-    // Follow up with the actual page image(s) for any answer whose
-    // evidence came from an image chunk (diagram/figure/table that had
-    // no usable extractable text) — see sendMatchedPageImages above.
-    // Sent regardless of which format (text/pdf/both) was chosen, since
-    // it's the only way this evidence reaches the user at all — EXCEPT
-    // in spoiler mode, where sending the page image unblurred would
-    // hand over the answer anyway and defeat the whole point of 🙈.
-    if (!spoiler) {
-      await sendMatchedPageImages(chatId, results);
-    }
-
+    const { pdfSent, generatedPdfBuffer: pdfBuf, generatedPdfFilename: pdfName, wantsPdf } = await deliverResults(
+      chatId,
+      results,
+      book,
+      fromUser,
+      format,
+      designId,
+      colorKey,
+      spoiler
+    );
+    generatedPdfBuffer = pdfBuf;
+    generatedPdfFilename = pdfName;
     // A question counts as "successfully answered" when Gemini matched
     // it to real book content (page !== null) and it wasn't a transient
     // error. Questions the book genuinely doesn't cover come back with
@@ -791,6 +909,12 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
     } else {
       await notifyAdmins(reportLines.join('\n\n'), { parse_mode: 'HTML' });
     }
+
+    // 🛠️ Offer 🔁 retry-failed / ✏️ reword follow-up actions on THIS
+    // batch's final results, so 2-3 failed/unclear questions out of a
+    // big batch (or one confusingly-worded question) can be fixed later
+    // without resubmitting or re-paying quota for everything again.
+    await offerRetryReword(chatId, fromUser, book, results, format, designId, colorKey, spoiler);
   } catch (err) {
     console.error('Answering failed:', err);
     if (err instanceof DailyLimitReachedError) {
@@ -2494,6 +2618,102 @@ if (data.startsWith('ansclr_')) {
     return;
   }
 
+  // 🔁 "إعادة محاولة الأسئلة اللي مالحقتش" — data is "ansretry_<token>".
+  // Re-answers ONLY the questions from the staged batch (see
+  // lib/answeredBatches.js) that came back with no page match or an
+  // outright error — same wording, no user input needed — then merges
+  // them back into the full result set in place and redelivers it. Costs
+  // Gemini quota for just that small subset, not the whole original batch.
+  if (data.startsWith('ansretry_')) {
+    const token = data.slice('ansretry_'.length);
+    const batch = await answeredBatches.peekBatch(userId, token);
+    if (!batch) {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    const failedIndices = batch.results
+      .map((r, i) => (r.isError || r.page === null ? i : -1))
+      .filter((i) => i !== -1);
+    if (failedIndices.length === 0) {
+      await telegram.answerCallbackQuery(cb.id, { text: '✅ كل الأسئلة اتجاوبت خلاص.', show_alert: true });
+      return;
+    }
+
+    const book = await books.getBook(batch.bookId);
+    if (!book || book.status !== 'ready') {
+      await telegram.answerCallbackQuery(cb.id, { text: '⚠️ الكتاب ده مبقاش متاح.', show_alert: true });
+      return;
+    }
+
+    await telegram.answerCallbackQuery(cb.id, { text: `⏳ بحاول تاني في ${failedIndices.length} سؤال...` });
+    await telegram.sendMessage(chatId, `🔁 جاري إعادة المحاولة لـ ${failedIndices.length} سؤال...`);
+
+    const usage = {
+      embeddingCalls: [],
+      generationCalls: [],
+      extractionGenerationCalls: [],
+      failures: [],
+      extractionFailures: [],
+    };
+    let extraKeys = [];
+    const ownKeys = await userApiKeys.getUserApiKeysList(userId);
+    if (ownKeys.length >= MIN_USER_KEYS_FOR_BOOST) extraKeys = ownKeys.map((k) => k.api_key);
+
+    const items = failedIndices.map((i) => ({ question: batch.results[i].question, chapter: batch.results[i].chapter }));
+    const retried = await answerQuestions(items, book.id, extraKeys, usage);
+
+    const merged = [...batch.results];
+    failedIndices.forEach((idx, pos) => {
+      merged[idx] = retried[pos];
+    });
+
+    await finalizeRetryOrReword(
+      chatId,
+      cb.from,
+      book,
+      merged,
+      batch.format,
+      batch.designId,
+      batch.colorKey,
+      batch.spoiler,
+      usage,
+      '🔁 <b>تقرير إعادة محاولة</b>'
+    );
+    return;
+  }
+
+  // ✏️ "توضيح/تعديل صياغة سؤال" — data is "ansreword_<token>". Doesn't
+  // re-answer anything itself — just remembers which batch is waiting for
+  // reworded question(s) next, so the very next text message from this
+  // user (see the pendingreword_ check in the main message handler below)
+  // is read as "<رقم>: <صياغة جديدة>" line(s) instead of routed as a new
+  // question/command.
+  if (data.startsWith('ansreword_')) {
+    const token = data.slice('ansreword_'.length);
+    const batch = await answeredBatches.peekBatch(userId, token);
+    if (!batch) {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    await botConfig.setConfig(`pendingreword_${userId}`, { token, createdAt: Date.now() });
+    await telegram.answerCallbackQuery(cb.id);
+    await telegram.sendMessage(
+      chatId,
+      '✏️ ابعت رقم السؤال والصياغة الجديدة بتاعته، سطر لكل تعديل، بالشكل ده:\n' +
+        '<رقم السؤال>: <الصياغة الجديدة>\n\n' +
+        'مثال:\n45: ما هو تعريف كذا بشكل أوضح؟\n52: قارن بين كذا وكذا من ناحية السبب والنتيجة'
+    );
+    return;
+  }
+
   if (data.startsWith('cmd_selectbook_')) {
     const bookId = Number(data.replace('cmd_selectbook_', ''));
     const book = await books.getBook(bookId);
@@ -2835,6 +3055,95 @@ module.exports = async (req, res) => {
             status: (t, extra) => telegram.sendMessage(chatId, t, extra),
           });
         }
+        res.status(200).json({ ok: true });
+        return;
+      }
+
+      // ✏️ Mid reword entry (see the ansreword_ callback above) — the very
+      // next text message from this user is read as "<رقم>: <صياغة جديدة>"
+      // line(s) instead of any other command/question routing below. Only
+      // the referenced question number(s) get re-answered with the new
+      // wording — everything else in the batch is left untouched — then
+      // the full merged batch is redelivered (see finalizeRetryOrReword).
+      const pendingReword = await botConfig.getConfig(`pendingreword_${fromUser.id}`);
+      if (pendingReword) {
+        const stale = Date.now() - (pendingReword.createdAt || 0) > 10 * 60 * 1000;
+        await botConfig.deleteConfig(`pendingreword_${fromUser.id}`);
+
+        if (stale) {
+          await telegram.sendMessage(chatId, '⚠️ الوقت خلص. دوس ✏️ تاني لو لسه عايز تعدّل سؤال.');
+          res.status(200).json({ ok: true });
+          return;
+        }
+
+        const batch = await answeredBatches.peekBatch(fromUser.id, pendingReword.token);
+        if (!batch) {
+          await telegram.sendMessage(chatId, '⚠️ الطلب ده قديم أو اتلغى. ابعت الأسئلة تاني.');
+          res.status(200).json({ ok: true });
+          return;
+        }
+
+        const edits = [];
+        text.split('\n').forEach((line) => {
+          const m = line.match(/^\s*(\d+)\s*[:\-]\s*(.+)$/);
+          if (!m) return;
+          const idx = Number(m[1]) - 1;
+          const newText = m[2].trim();
+          if (idx >= 0 && idx < batch.results.length && newText) edits.push({ idx, newText });
+        });
+
+        if (edits.length === 0) {
+          // Keep waiting — restore the pending state and ask again rather
+          // than dropping the flow on one bad input.
+          await botConfig.setConfig(`pendingreword_${fromUser.id}`, pendingReword);
+          await telegram.sendMessage(
+            chatId,
+            '⚠️ مقدرتش ألاقي صيغة صحيحة. ابعت بالشكل ده: <رقم السؤال>: <الصياغة الجديدة> (سطر لكل تعديل).'
+          );
+          res.status(200).json({ ok: true });
+          return;
+        }
+
+        const book = await books.getBook(batch.bookId);
+        if (!book || book.status !== 'ready') {
+          await telegram.sendMessage(chatId, '⚠️ الكتاب ده مبقاش متاح. ابعت الأسئلة تاني.');
+          res.status(200).json({ ok: true });
+          return;
+        }
+
+        await telegram.sendMessage(chatId, `✏️ جاري إعادة الإجابة على ${edits.length} سؤال بالصياغة الجديدة...`);
+
+        const usage = {
+          embeddingCalls: [],
+          generationCalls: [],
+          extractionGenerationCalls: [],
+          failures: [],
+          extractionFailures: [],
+        };
+        let extraKeys = [];
+        const ownKeys = await userApiKeys.getUserApiKeysList(fromUser.id);
+        if (ownKeys.length >= MIN_USER_KEYS_FOR_BOOST) extraKeys = ownKeys.map((k) => k.api_key);
+
+        const items = edits.map((e) => ({ question: e.newText, chapter: batch.results[e.idx].chapter }));
+        const reAnswered = await answerQuestions(items, book.id, extraKeys, usage);
+
+        const merged = [...batch.results];
+        edits.forEach((e, pos) => {
+          merged[e.idx] = reAnswered[pos];
+        });
+
+        await finalizeRetryOrReword(
+          chatId,
+          fromUser,
+          book,
+          merged,
+          batch.format,
+          batch.designId,
+          batch.colorKey,
+          batch.spoiler,
+          usage,
+          '✏️ <b>تقرير تعديل صياغة سؤال</b>'
+        );
         res.status(200).json({ ok: true });
         return;
       }
