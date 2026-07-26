@@ -676,22 +676,28 @@ async function deliverResults(chatId, results, book, fromUser, format, designId,
   return { pdfSent, generatedPdfBuffer, generatedPdfFilename, wantsPdf };
 }
 
-// 🔁✏️ Retry-failed / reword-a-question support ----------------------------
+// 🔁✏️➕➖ Retry-failed / edit-a-question support ---------------------------
 // After delivering a batch's results, we stage the FINAL result array in
-// lib/answeredBatches.js and offer two follow-up actions — both re-answer
-// only a SMALL subset of the original batch (not all of it), so retrying
-// 2-3 failed/unclear questions out of 100, or clarifying one confusing
-// question's wording, doesn't re-consume quota for the other 97+:
+// lib/answeredBatches.js and offer two follow-up actions — all of which
+// re-answer only a SMALL subset of the original batch (not all of it), so
+// retrying 2-3 failed/unclear questions out of 100, rewording one
+// confusing question, adding a missed one at a specific spot, or deleting
+// an irrelevant one, doesn't re-consume quota for the other 97+:
 //   🔁 إعادة محاولة  — re-runs every question that came back with no page
 //      match (page === null, including the "مش واضحة" fallback) or an
 //      outright error, using the SAME wording.
-//   ✏️ تعديل/توضيح سؤال — the user replies with "<رقم>: <صياغة جديدة>"
-//      (one per line) for any question number(s) from what they were
-//      just sent, and only those get re-answered with the new wording.
-// Either path merges the re-answered subset back into the full results
-// array IN PLACE (no reordering), then redelivers the complete, updated
-// set — so the user always gets one coherent full reply/PDF, not a
-// separate mini-answer for just the retried/reworded items.
+//   ✏️➕➖ تعديل/إضافة/حذف سؤال — the user replies with one line per edit
+//      (see buildEditedResults below for the exact syntax): "<رقم>:
+//      <صياغة جديدة>" to reword, "add <رقم>: <نص السؤال>" to insert a new
+//      question at that exact position (shifting everything after it down
+//      by one), or "delete <رقم>" to remove a question entirely. Only the
+//      reworded/added questions actually get (re-)answered by Gemini;
+//      deletes cost nothing.
+// Every path merges the change(s) back into the full results array (no
+// separate reordering step needed — buildEditedResults already produces
+// the final order), then redelivers the complete, updated set — so the
+// user always gets one coherent full reply/PDF, not a separate mini-answer
+// for just the changed items.
 function buildRetryRewordKeyboard(token, failedCount) {
   const rows = [];
   if (failedCount > 0) {
@@ -699,7 +705,7 @@ function buildRetryRewordKeyboard(token, failedCount) {
       { text: `🔁 إعادة محاولة الأسئلة اللي مالحقتش (${failedCount})`, callback_data: `ansretry_${token}` },
     ]);
   }
-  rows.push([{ text: '✏️ توضيح/تعديل صياغة سؤال', callback_data: `ansreword_${token}` }]);
+  rows.push([{ text: '✏️➕➖ تعديل/إضافة/حذف سؤال', callback_data: `ansreword_${token}` }]);
   return { inline_keyboard: rows };
 }
 
@@ -721,8 +727,8 @@ async function offerRetryReword(chatId, fromUser, book, results, format, designI
   });
   const note =
     failedCount > 0
-      ? `🛠️ ${failedCount} سؤال لسه محتاج توضيح أو معندوش إجابة واضحة. تقدر تعيد المحاولة أو توضّح صياغة أي سؤال من غير ما تبعت الـ ${results.length} سؤال تاني:`
-      : `🛠️ لو حابب توضّح صياغة أي سؤال عشان تاخد إجابة أدق، من غير ما تبعت الأسئلة تاني:`;
+      ? `🛠️ ${failedCount} سؤال لسه محتاج توضيح أو معندوش إجابة واضحة. تقدر تعيد المحاولة، أو تعدّل/تضيف/تحذف أي سؤال من غير ما تبعت الـ ${results.length} سؤال تاني:`
+      : `🛠️ لو حابب تعدّل صياغة، تضيف، أو تحذف أي سؤال من غير ما تبعت الأسئلة تاني:`;
   await telegram.sendMessage(chatId, note, { reply_markup: buildRetryRewordKeyboard(token, failedCount) });
 }
 
@@ -732,6 +738,97 @@ async function offerRetryReword(chatId, fromUser, book, results, format, designI
 // admin report for just this follow-up action, then re-stages the updated
 // results so the buttons can be used again (e.g. reword one question, then
 // later retry/reword another).
+// Parses the free-text reply to the ✏️➕➖ button into a list of edit
+// operations. Each line must be one of:
+//   "<number>: <new wording>"   → REWORD the question currently at that
+//                                  position with new wording.
+//   "add <number>: <question>"  → ADD a brand-new question so it lands
+//                                  EXACTLY at that position (shifting the
+//                                  question that used to be there, and
+//                                  everything after it, down by one).
+//   "delete <number>"           → DELETE the question at that position
+//                                  entirely (no Gemini call needed).
+// All <number>s refer to the ORIGINAL numbering the user was just shown
+// (batch.results, before any of these edits are applied) — not a
+// running/shifting count as edits are processed one by one. That's what
+// makes "add 43: ..." land exactly where the user expects even when the
+// same message also deletes or adds other questions.
+function parseEditLines(text, resultsLength) {
+  const rewords = new Map(); // 0-based idx -> new question text
+  const deletes = new Set(); // 0-based idx
+  const adds = []; // { atIndex (0-based, insert BEFORE this original position), question }
+
+  text.split('\n').forEach((rawLine) => {
+    const line = rawLine.trim();
+    if (!line) return;
+
+    const addMatch = line.match(/^add\s+(\d+)\s*[:\-]\s*(.+)$/i);
+    if (addMatch) {
+      const pos = Number(addMatch[1]) - 1;
+      const question = addMatch[2].trim();
+      // Valid target positions are 0..resultsLength (resultsLength itself
+      // means "insert as the new last question").
+      if (pos >= 0 && pos <= resultsLength && question) adds.push({ atIndex: pos, question });
+      return;
+    }
+
+    const deleteMatch = line.match(/^delete\s+(\d+)\s*$/i);
+    if (deleteMatch) {
+      const idx = Number(deleteMatch[1]) - 1;
+      if (idx >= 0 && idx < resultsLength) deletes.add(idx);
+      return;
+    }
+
+    const rewordMatch = line.match(/^(\d+)\s*[:\-]\s*(.+)$/);
+    if (rewordMatch) {
+      const idx = Number(rewordMatch[1]) - 1;
+      const newText = rewordMatch[2].trim();
+      if (idx >= 0 && idx < resultsLength && newText) rewords.set(idx, newText);
+    }
+  });
+
+  return { rewords, deletes, adds };
+}
+
+// Builds the ordered "plan" for the final results array from the parsed
+// edits: existing (untouched) items pass through as-is; reworded/added
+// items are left as { needsAnswer: true, question, chapter } placeholders
+// to be answered in ONE combined Gemini batch call by the caller, then
+// spliced back in. Deletes simply aren't included in the output.
+// A delete on an index wins over a reword of that same index (a question
+// that's being removed doesn't need its wording touched).
+function buildEditedResults(originalResults, edits) {
+  const addsByPos = new Map();
+  edits.adds.forEach(({ atIndex, question }) => {
+    if (!addsByPos.has(atIndex)) addsByPos.set(atIndex, []);
+    addsByPos.get(atIndex).push(question);
+  });
+
+  const n = originalResults.length;
+  const plan = [];
+  for (let i = 0; i <= n; i++) {
+    if (addsByPos.has(i)) {
+      // New questions inserted here inherit the chapter/section tag of
+      // whichever existing question currently sits at this position (or
+      // the last question's chapter if appended at the very end), so
+      // lib/pdfGenerator.js's chapter banners stay sensible.
+      const chapter = i < n ? originalResults[i]?.chapter ?? null : originalResults[n - 1]?.chapter ?? null;
+      addsByPos.get(i).forEach((question) => {
+        plan.push({ needsAnswer: true, question, chapter });
+      });
+    }
+    if (i < n) {
+      if (edits.deletes.has(i)) continue;
+      if (edits.rewords.has(i)) {
+        plan.push({ needsAnswer: true, question: edits.rewords.get(i), chapter: originalResults[i].chapter ?? null });
+      } else {
+        plan.push({ needsAnswer: false, item: originalResults[i] });
+      }
+    }
+  }
+  return plan;
+}
+
 async function finalizeRetryOrReword(chatId, fromUser, book, results, format, designId, colorKey, spoiler, usage, reportTitle) {
   const { pdfSent, generatedPdfBuffer, generatedPdfFilename, wantsPdf } = await deliverResults(
     chatId,
@@ -2686,12 +2783,13 @@ if (data.startsWith('ansclr_')) {
     return;
   }
 
-  // ✏️ "توضيح/تعديل صياغة سؤال" — data is "ansreword_<token>". Doesn't
-  // re-answer anything itself — just remembers which batch is waiting for
-  // reworded question(s) next, so the very next text message from this
-  // user (see the pendingreword_ check in the main message handler below)
-  // is read as "<رقم>: <صياغة جديدة>" line(s) instead of routed as a new
-  // question/command.
+  // ✏️➕➖ "تعديل/إضافة/حذف سؤال" — data is "ansreword_<token>". Doesn't
+  // re-answer/change anything itself — just remembers which batch is
+  // waiting for edit line(s) next, so the very next text message from
+  // this user (see the pendingreword_ check in the main message handler
+  // below) is parsed as reword/add/delete instructions instead of routed
+  // as a new question/command. See buildEditedResults below for the
+  // three supported line formats.
   if (data.startsWith('ansreword_')) {
     const token = data.slice('ansreword_'.length);
     const batch = await answeredBatches.peekBatch(userId, token);
@@ -2707,12 +2805,18 @@ if (data.startsWith('ansclr_')) {
     await telegram.answerCallbackQuery(cb.id);
     await telegram.sendMessage(
       chatId,
-      '✏️ ابعت رقم السؤال والصياغة الجديدة بتاعته، سطر لكل تعديل، بالشكل ده:\n' +
-        '<رقم السؤال>: <الصياغة الجديدة>\n\n' +
-        'مثال:\n45: ما هو تعريف كذا بشكل أوضح؟\n52: قارن بين كذا وكذا من ناحية السبب والنتيجة'
+      '✏️➕➖ ابعتلي سطر لكل تعديل عايز تعمله (تقدر تخلط أكتر من نوع في نفس الرسالة):\n\n' +
+        '• *تعديل صياغة سؤال موجود:* اكتب رقم السؤال ونقطتين وبعدين الصياغة الجديدة.\n' +
+        '• *إضافة سؤال جديد في مكان معيّن:* اكتب كلمة add ورقم المكان ونقطتين وبعدين نص السؤال — السؤال هيتحط في المكان ده بالظبط، وكل اللي بعده هيتزحلق رقم واحد.\n' +
+        '• *حذف سؤال:* اكتب كلمة delete ورقم السؤال، من غير أي حاجة تانية.\n\n' +
+        'مثال (Examples):\n' +
+        '45: What is a clearer definition of photosynthesis?\n' +
+        'add 43: How does osmosis differ from diffusion?\n' +
+        'delete 12'
     );
     return;
   }
+
 
   if (data.startsWith('cmd_selectbook_')) {
     const bookId = Number(data.replace('cmd_selectbook_', ''));
@@ -3059,19 +3163,20 @@ module.exports = async (req, res) => {
         return;
       }
 
-      // ✏️ Mid reword entry (see the ansreword_ callback above) — the very
-      // next text message from this user is read as "<رقم>: <صياغة جديدة>"
+      // ✏️➕➖ Mid edit entry (see the ansreword_ callback above) — the very
+      // next text message from this user is parsed as reword/add/delete
       // line(s) instead of any other command/question routing below. Only
-      // the referenced question number(s) get re-answered with the new
-      // wording — everything else in the batch is left untouched — then
-      // the full merged batch is redelivered (see finalizeRetryOrReword).
+      // the referenced question number(s) get touched — everything else
+      // in the batch is left untouched — then the full merged batch is
+      // redelivered (see finalizeRetryOrReword). See parseEditLines /
+      // buildEditedResults above for the exact per-line syntax.
       const pendingReword = await botConfig.getConfig(`pendingreword_${fromUser.id}`);
       if (pendingReword) {
         const stale = Date.now() - (pendingReword.createdAt || 0) > 10 * 60 * 1000;
         await botConfig.deleteConfig(`pendingreword_${fromUser.id}`);
 
         if (stale) {
-          await telegram.sendMessage(chatId, '⚠️ الوقت خلص. دوس ✏️ تاني لو لسه عايز تعدّل سؤال.');
+          await telegram.sendMessage(chatId, '⚠️ الوقت خلص. دوس ✏️➕➖ تاني لو لسه عايز تعدّل/تضيف/تحذف سؤال.');
           res.status(200).json({ ok: true });
           return;
         }
@@ -3083,22 +3188,19 @@ module.exports = async (req, res) => {
           return;
         }
 
-        const edits = [];
-        text.split('\n').forEach((line) => {
-          const m = line.match(/^\s*(\d+)\s*[:\-]\s*(.+)$/);
-          if (!m) return;
-          const idx = Number(m[1]) - 1;
-          const newText = m[2].trim();
-          if (idx >= 0 && idx < batch.results.length && newText) edits.push({ idx, newText });
-        });
+        const edits = parseEditLines(text, batch.results.length);
+        const editCount = edits.rewords.size + edits.deletes.size + edits.adds.length;
 
-        if (edits.length === 0) {
+        if (editCount === 0) {
           // Keep waiting — restore the pending state and ask again rather
           // than dropping the flow on one bad input.
           await botConfig.setConfig(`pendingreword_${fromUser.id}`, pendingReword);
           await telegram.sendMessage(
             chatId,
-            '⚠️ مقدرتش ألاقي صيغة صحيحة. ابعت بالشكل ده: <رقم السؤال>: <الصياغة الجديدة> (سطر لكل تعديل).'
+            '⚠️ مقدرتش ألاقي صيغة صحيحة. استخدم واحد من الأشكال دي، سطر لكل تعديل:\n' +
+              '<رقم>: <الصياغة الجديدة>\n' +
+              'add <رقم>: <نص السؤال الجديد>\n' +
+              'delete <رقم>'
           );
           res.status(200).json({ ok: true });
           return;
@@ -3111,7 +3213,11 @@ module.exports = async (req, res) => {
           return;
         }
 
-        await telegram.sendMessage(chatId, `✏️ جاري إعادة الإجابة على ${edits.length} سؤال بالصياغة الجديدة...`);
+        const summaryParts = [];
+        if (edits.rewords.size > 0) summaryParts.push(`تعديل ${edits.rewords.size}`);
+        if (edits.adds.length > 0) summaryParts.push(`إضافة ${edits.adds.length}`);
+        if (edits.deletes.size > 0) summaryParts.push(`حذف ${edits.deletes.size}`);
+        await telegram.sendMessage(chatId, `✏️➕➖ جاري تنفيذ: ${summaryParts.join('، ')}...`);
 
         const usage = {
           embeddingCalls: [],
@@ -3124,13 +3230,13 @@ module.exports = async (req, res) => {
         const ownKeys = await userApiKeys.getUserApiKeysList(fromUser.id);
         if (ownKeys.length >= MIN_USER_KEYS_FOR_BOOST) extraKeys = ownKeys.map((k) => k.api_key);
 
-        const items = edits.map((e) => ({ question: e.newText, chapter: batch.results[e.idx].chapter }));
-        const reAnswered = await answerQuestions(items, book.id, extraKeys, usage);
-
-        const merged = [...batch.results];
-        edits.forEach((e, pos) => {
-          merged[e.idx] = reAnswered[pos];
-        });
+        const plan = buildEditedResults(batch.results, edits);
+        const toAnswer = plan.filter((p) => p.needsAnswer).map((p) => ({ question: p.question, chapter: p.chapter }));
+        // toAnswer can be empty (a message that's ONLY deletes needs no
+        // Gemini call at all — skip straight to the merge).
+        const answered = toAnswer.length > 0 ? await answerQuestions(toAnswer, book.id, extraKeys, usage) : [];
+        let ai = 0;
+        const merged = plan.map((p) => (p.needsAnswer ? answered[ai++] : p.item));
 
         await finalizeRetryOrReword(
           chatId,
@@ -3142,7 +3248,7 @@ module.exports = async (req, res) => {
           batch.colorKey,
           batch.spoiler,
           usage,
-          '✏️ <b>تقرير تعديل صياغة سؤال</b>'
+          '✏️➕➖ <b>تقرير تعديل الأسئلة</b>'
         );
         res.status(200).json({ ok: true });
         return;
