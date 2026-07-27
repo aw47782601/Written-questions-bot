@@ -641,8 +641,14 @@ async function deliverResults(chatId, results, book, fromUser, format, designId,
           colorKey: colorKey || pdfColors.DEFAULT_PDF_COLOR,
         });
         const pdfFilename = `answers_${Date.now()}.pdf`;
+        // Same "successfully answered" convention used in the admin
+        // report below (finalizeRetryOrReword / processBatchWithFormat):
+        // a question counts as answered when it wasn't a transient error
+        // AND Gemini matched it to real book content (page !== null).
+        const totalCount = results.length;
+        const answeredCount = results.filter((r) => !r.isError && r.page !== null).length;
         await telegram.sendDocument(chatId, pdfBuffer, pdfFilename, {
-          caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"`,
+          caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"\n✅ تم الإجابة على ${answeredCount} من ${totalCount} سؤال`,
         });
         pdfSent = true;
         generatedPdfBuffer = pdfBuffer;
@@ -2885,8 +2891,8 @@ if (data.startsWith('ansclr_')) {
         '45: What is a clearer definition of photosynthesis?\n' +
         'add 43: How does osmosis differ from diffusion?\n' +
         'delete 12\n' +
-        'answer 49: Photosynthesis is the process by which plants convert light energy into chemical energy, producing glucose and oxygen from carbon dioxide and water.'
-        );
+        'answer 49: الإجابة عندي إن الخلية النباتية بتختلف عن الحيوانية إنها فيها جدار خلوي وبلاستيدات خضراء وفجوة عصارية كبيرة'
+    );
     return;
   }
 
