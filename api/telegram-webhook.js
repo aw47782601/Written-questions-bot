@@ -2885,8 +2885,8 @@ if (data.startsWith('ansclr_')) {
         '45: What is a clearer definition of photosynthesis?\n' +
         'add 43: How does osmosis differ from diffusion?\n' +
         'delete 12\n' +
-        'answer 49: الإجابة عندي إن الخلية النباتية بتختلف عن الحيوانية إنها فيها جدار خلوي وبلاستيدات خضراء وفجوة عصارية كبيرة'
-    );
+        'answer 49: Photosynthesis is the process by which plants convert light energy into chemical energy, producing glucose and oxygen from carbon dioxide and water.'
+        );
     return;
   }
 
