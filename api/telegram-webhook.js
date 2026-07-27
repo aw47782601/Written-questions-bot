@@ -8,7 +8,8 @@ const {
   extractQuestionsFromPlainTextBuffer,
   extractQuestionsFromText,
 } = require('../lib/questionExtractor');
-const { answerQuestions, formatUserAnswers } = require('../lib/batchAnswer');
+const { answerQuestions } = require('../lib/batchAnswer');
+const { formatUserAnswers } = require('../lib/answeredBatches');
 const collectSession = require('../lib/collectSession');
 const pdfDesigns = require('../lib/pdfDesigns');
 const pdfAccess = require('../lib/pdfAccess');
