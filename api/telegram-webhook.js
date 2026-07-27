@@ -19,6 +19,7 @@ const botConfig = require('../lib/botConfig');
 const users = require('../lib/users');
 const pendingBatches = require('../lib/pendingBatches');
 const answeredBatches = require('../lib/answeredBatches');
+const bookFolders = require('../lib/bookFolders');
 const userApiKeys = require('../lib/userApiKeys');
 const telegramUpdates = require('../lib/telegramUpdates');
 const cairoTime = require('../lib/cairoTime');
@@ -1107,35 +1108,64 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
   }
 }
 
+// Chunks a flat array of inline-keyboard buttons into rows of `perRow`
+// buttons each — used for the folder grid (2 folders per row) both in
+// the admin /books view and the user-facing /mybook view.
+function chunkButtons(buttonList, perRow) {
+  const rows = [];
+  for (let i = 0; i < buttonList.length; i += perRow) {
+    rows.push(buttonList.slice(i, i + perRow));
+  }
+  return rows;
+}
+
 // Builds the text + inline keyboard for the admin book list/management
-// screen. Shared by the /books /status commands (new message) and the
-// "🔙 رجوع" callback (edits the existing message back to this view).
+// screen (top level). Books are grouped into folders (see
+// lib/bookFolders.js) so a large library (30+ books) stays browsable —
+// folders show 2 per row, plus a "📂 بدون مجلد" bucket for any book not
+// yet filed into one. Shared by the /books /status commands (new
+// message) and the "🔙 رجوع" callback (edits the existing message back
+// to this view).
 async function buildBooksOverview() {
   const allBooks = await books.listBooks();
-  if (allBooks.length === 0) {
+  const state = await bookFolders.getFoldersState();
+
+  if (allBooks.length === 0 && state.folders.length === 0) {
     return {
-      text: 'لسه مفيش أي كتاب مضاف. اضغط الزر تحت عشان تضيف كتاب.',
-      reply_markup: { inline_keyboard: [[{ text: '➕ إضافة كتاب جديد', callback_data: 'cmd_addbooknew' }]] },
+      text: 'لسه مفيش أي كتاب أو مجلد مضاف. اضغط الأزرار تحت عشان تبدأ.',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '➕ إضافة مجلد جديد', callback_data: 'cmd_addfoldernew' }],
+          [{ text: '➕ إضافة كتاب جديد', callback_data: 'cmd_addbooknew' }],
+        ],
+      },
     };
   }
-  const lines = allBooks.map((b) => {
-    const parts = [
-      `📖 <b>${escapeHtml(b.name)}</b> (ID: <code>${b.id}</code>)`,
-      `الحالة: ${b.status}`,
-      b.file_name ? `الملف: ${escapeHtml(b.file_name)}` : null,
-      b.total_pages ? `عدد الصفحات: ${b.total_pages}` : null,
-      b.total_chunks ? `عدد الأجزاء: ${b.total_chunks}` : null,
-      b.error_message ? `آخر خطأ: ${escapeHtml(b.error_message)}` : null,
-    ].filter(Boolean);
-    return parts.join('\n');
-  });
-  lines.push(`موديل الـ embedding الحالي: ${env.GEMINI_EMBEDDING_MODEL}`);
-  lines.push('اختار كتاب تحت عشان تغيّر اسمه أو تحذفه:');
 
-  const buttons = allBooks.map((b) => [{ text: `⚙️ ${b.name}`, callback_data: `cmd_bookmenu_${b.id}` }]);
-  buttons.push([{ text: '➕ إضافة كتاب جديد', callback_data: 'cmd_addbooknew' }]);
+  const { folders, unfiled } = bookFolders.groupBooksByFolder(allBooks, state);
 
-  return { text: lines.join('\n\n'), reply_markup: { inline_keyboard: buttons } };
+  const lines = [
+    `📚 إجمالي الكتب: ${allBooks.length} — عدد المجلدات: ${folders.length}`,
+    `موديل الـ embedding الحالي: ${env.GEMINI_EMBEDDING_MODEL}`,
+    'اختار مجلد عشان تشوف الكتب اللي جواه:',
+  ];
+
+  const folderButtons = folders.map((f) => ({
+    text: `📁 ${f.name} (${f.books.length})`,
+    callback_data: `cmd_folderopen_${f.id}`,
+  }));
+  if (unfiled.length > 0 || folders.length === 0) {
+    folderButtons.push({
+      text: `📂 بدون مجلد (${unfiled.length})`,
+      callback_data: `cmd_folderopen_${bookFolders.UNFILED_KEY}`,
+    });
+  }
+
+  const keyboard = chunkButtons(folderButtons, 2);
+  keyboard.push([{ text: '➕ إضافة مجلد جديد', callback_data: 'cmd_addfoldernew' }]);
+  keyboard.push([{ text: '➕ إضافة كتاب جديد', callback_data: 'cmd_addbooknew' }]);
+
+  return { text: lines.join('\n\n'), reply_markup: { inline_keyboard: keyboard } };
 }
 
 async function handleStatusCommand(chatId) {
@@ -1147,22 +1177,179 @@ async function handleBooksList(chatId) {
   return handleStatusCommand(chatId);
 }
 
-// Edits an existing admin message back to the book overview (used by the
-// "🔙 رجوع" button so browsing books/renaming/deleting stays in one
-// message instead of spamming new ones).
+// Edits an existing admin message back to the top-level folder overview
+// (used by the "🔙 رجوع" button so browsing folders/books/renaming/
+// deleting stays in one message instead of spamming new ones).
 async function handleBooksBackButton(chatId, messageId) {
   const { text, reply_markup } = await buildBooksOverview();
   await telegram.editMessageText(chatId, messageId, text, { parse_mode: 'HTML', reply_markup });
 }
 
-// Per-book management submenu: rename / delete / back. Reached by
-// tapping a book in the overview list (⚙️ <name>).
+// Books within one folder (or the "بدون مجلد" bucket when folderKey is
+// bookFolders.UNFILED_KEY): same per-book "⚙️ <name>" buttons as the old
+// flat list, plus folder-level rename/delete for a real folder, and a
+// back button to the top-level folder overview. Returns null if the
+// folder was deleted out from under the button press.
+async function buildFolderBooksView(folderKey) {
+  const allBooks = await books.listBooks();
+  const state = await bookFolders.getFoldersState();
+  const { folders, unfiled } = bookFolders.groupBooksByFolder(allBooks, state);
+
+  const isUnfiled = folderKey === bookFolders.UNFILED_KEY;
+  const folder = isUnfiled ? null : folders.find((f) => f.id === Number(folderKey));
+  if (!isUnfiled && !folder) return null;
+
+  const booksInFolder = isUnfiled ? unfiled : folder.books;
+  const title = isUnfiled ? '📂 بدون مجلد' : `📁 ${folder.name}`;
+
+  const lines = [`<b>${escapeHtml(title)}</b>`];
+  lines.push(
+    booksInFolder.length === 0
+      ? 'مفيش كتب هنا لسه.'
+      : 'اختار كتاب تحت عشان تغيّر اسمه، تحذفه، أو تنقله لمجلد تاني:'
+  );
+
+  const keyboard = booksInFolder.map((b) => [{ text: `⚙️ ${b.name}`, callback_data: `cmd_bookmenu_${b.id}` }]);
+  if (!isUnfiled) {
+    keyboard.push([{ text: '✏️ تغيير اسم المجلد', callback_data: `cmd_folderrename_${folder.id}` }]);
+    keyboard.push([{ text: '🗑 حذف المجلد', callback_data: `cmd_folderdelete_${folder.id}` }]);
+  }
+  keyboard.push([{ text: '🔙 رجوع', callback_data: 'cmd_booksback' }]);
+
+  return { text: lines.join('\n\n'), reply_markup: { inline_keyboard: keyboard } };
+}
+
+async function handleFolderOpenButton(chatId, messageId, folderKey) {
+  const view = await buildFolderBooksView(folderKey);
+  if (!view) {
+    await telegram.editMessageText(chatId, messageId, '❌ المجلد ده اتحذف بالفعل.');
+    return;
+  }
+  await telegram.editMessageText(chatId, messageId, view.text, { parse_mode: 'HTML', reply_markup: view.reply_markup });
+}
+
+// Puts the admin into "waiting to type a new folder's name" mode.
+async function handleAddFolderNewPrompt(chatId, messageId, adminId) {
+  await botConfig.setConfig(`addfolder_waitname_${adminId}`, { active: true });
+  await telegram.editMessageText(chatId, messageId, '📁 ابعت اسم المجلد الجديد دلوقت كرسالة نصية.', {
+    reply_markup: { inline_keyboard: [[{ text: '❌ إلغاء', callback_data: 'cmd_booksback' }]] },
+  });
+}
+
+// Called when a plain-text message arrives while the admin is in
+// "waiting to type a new folder's name" mode. Returns true if handled.
+async function tryHandleAddFolderNamePaste(chatId, adminId, text) {
+  const state = await botConfig.getConfig(`addfolder_waitname_${adminId}`);
+  if (!state || !state.active) return false;
+
+  await botConfig.deleteConfig(`addfolder_waitname_${adminId}`);
+  const name = text.trim();
+  if (!name) {
+    await telegram.sendMessage(chatId, '⚠️ الاسم فاضي، اتلغت العملية. استخدم /books تاني لو عايز تحاول.');
+    return true;
+  }
+  await bookFolders.createFolder(name);
+  await telegram.sendMessage(chatId, `✅ تم إضافة مجلد "${escapeHtml(name)}". استخدم /books عشان تشوفه.`, {
+    parse_mode: 'HTML',
+  });
+  return true;
+}
+
+// Puts the admin into "waiting to type the new name" mode for a folder.
+async function handleFolderRenameStart(chatId, messageId, adminId, folderId) {
+  const folder = await bookFolders.getFolder(folderId);
+  if (!folder) {
+    await telegram.editMessageText(chatId, messageId, '❌ المجلد ده اتحذف بالفعل.');
+    return;
+  }
+  await botConfig.setConfig(`renamefolder_${adminId}`, { folderId });
+  await telegram.editMessageText(
+    chatId,
+    messageId,
+    `✏️ ابعت الاسم الجديد لمجلد "${escapeHtml(folder.name)}" دلوقت كرسالة نصية.`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '❌ إلغاء', callback_data: `cmd_folderopen_${folderId}` }]] },
+    }
+  );
+}
+
+// Called when a plain-text message arrives while the admin is in
+// "waiting to type a new folder name" mode. Returns true if handled.
+async function tryHandleFolderRenamePaste(chatId, adminId, text) {
+  const state = await botConfig.getConfig(`renamefolder_${adminId}`);
+  if (!state || !state.folderId) return false;
+
+  await botConfig.deleteConfig(`renamefolder_${adminId}`);
+  const newName = text.trim();
+  if (!newName) {
+    await telegram.sendMessage(chatId, '⚠️ الاسم فاضي، اتلغت العملية. استخدم /books تاني لو عايز تحاول.');
+    return true;
+  }
+  const folder = await bookFolders.getFolder(state.folderId);
+  if (!folder) {
+    await telegram.sendMessage(chatId, '❌ المجلد ده اتحذف بالفعل.');
+    return true;
+  }
+  await bookFolders.renameFolder(state.folderId, newName);
+  await telegram.sendMessage(
+    chatId,
+    `✅ تم تغيير اسم المجلد من "${escapeHtml(folder.name)}" إلى "${escapeHtml(newName)}".`,
+    { parse_mode: 'HTML' }
+  );
+  return true;
+}
+
+async function handleFolderDeleteConfirmPrompt(chatId, messageId, folderId) {
+  const folder = await bookFolders.getFolder(folderId);
+  if (!folder) {
+    await telegram.editMessageText(chatId, messageId, '❌ المجلد ده اتحذف بالفعل.');
+    return;
+  }
+  await telegram.editMessageText(
+    chatId,
+    messageId,
+    `⚠️ متأكد إنك عايز تحذف مجلد "${escapeHtml(folder.name)}"؟ الكتب اللي جواه هتفضل موجودة، بس هتبقى بدون مجلد.`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '✅ نعم، احذف', callback_data: `cmd_folderdeleteconfirm_${folderId}` }],
+          [{ text: '❌ إلغاء', callback_data: `cmd_folderopen_${folderId}` }],
+        ],
+      },
+    }
+  );
+}
+
+async function handleFolderDeleteConfirmed(chatId, messageId, folderId) {
+  const folder = await bookFolders.getFolder(folderId);
+  if (!folder) {
+    await telegram.editMessageText(chatId, messageId, '❌ المجلد ده اتحذف بالفعل.');
+    return;
+  }
+  await bookFolders.deleteFolder(folderId);
+  await telegram.editMessageText(
+    chatId,
+    messageId,
+    `✅ تم حذف مجلد "${escapeHtml(folder.name)}". الكتب اللي كانت جواه بقت بدون مجلد.`,
+    { parse_mode: 'HTML' }
+  );
+}
+
+// Per-book management submenu: rename / move to folder / delete / back.
+// Reached by tapping a book inside a folder view (⚙️ <name>). The back
+// button returns to whichever folder (or "بدون مجلد") this book
+// currently lives in, so browsing stays contextual instead of always
+// jumping to the top-level overview.
 async function handleBookMenuButton(chatId, messageId, bookId) {
   const book = await books.getBook(bookId);
   if (!book) {
     await telegram.editMessageText(chatId, messageId, '❌ الكتاب ده اتحذف بالفعل.');
     return;
   }
+  const folderId = await bookFolders.getBookFolderId(bookId);
+  const backCallback = `cmd_folderopen_${folderId != null ? folderId : bookFolders.UNFILED_KEY}`;
   const text =
     `📖 <b>${escapeHtml(book.name)}</b> (ID: <code>${book.id}</code>)\n` +
     `الحالة: ${book.status}${book.total_pages ? `\nعدد الصفحات: ${book.total_pages}` : ''}\n\n` +
@@ -1172,11 +1359,64 @@ async function handleBookMenuButton(chatId, messageId, bookId) {
     reply_markup: {
       inline_keyboard: [
         [{ text: '✏️ تغيير الاسم', callback_data: `cmd_bookrename_${book.id}` }],
+        [{ text: '📁 نقل لمجلد', callback_data: `cmd_bookmovefolder_${book.id}` }],
         [{ text: '🗑 حذف الكتاب', callback_data: `cmd_bookdelete_${book.id}` }],
-        [{ text: '🔙 رجوع', callback_data: 'cmd_booksback' }],
+        [{ text: '🔙 رجوع', callback_data: backCallback }],
       ],
     },
   });
+}
+
+// Folder picker shown from a book's menu ("📁 نقل لمجلد") — lets the
+// admin move a book into a different folder, or back out to unfiled,
+// without leaving the book-management flow. 2 folders per row, same
+// grid as the top-level overview. The book's current folder (if any)
+// is marked with ✅.
+async function buildBookMoveFolderView(bookId) {
+  const folders = await bookFolders.listFolders();
+  const currentFolderId = await bookFolders.getBookFolderId(bookId);
+
+  const folderButtons = folders.map((f) => ({
+    text: `${f.id === currentFolderId ? '✅ ' : ''}📁 ${f.name}`,
+    callback_data: `cmd_bookmoveto_${bookId}_${f.id}`,
+  }));
+  const keyboard = chunkButtons(folderButtons, 2);
+  keyboard.push([
+    {
+      text: `${currentFolderId == null ? '✅ ' : ''}📂 بدون مجلد`,
+      callback_data: `cmd_bookmoveto_${bookId}_${bookFolders.UNFILED_KEY}`,
+    },
+  ]);
+  keyboard.push([{ text: '🔙 رجوع', callback_data: `cmd_bookmenu_${bookId}` }]);
+
+  return {
+    text:
+      folders.length === 0
+        ? 'مفيش مجلدات لسه — أضف مجلد الأول من الشاشة الرئيسية (/books).'
+        : 'اختار المجلد اللي عايز تنقل الكتاب له:',
+    reply_markup: { inline_keyboard: keyboard },
+  };
+}
+
+async function handleBookMoveFolderPrompt(chatId, messageId, bookId) {
+  const book = await books.getBook(bookId);
+  if (!book) {
+    await telegram.editMessageText(chatId, messageId, '❌ الكتاب ده اتحذف بالفعل.');
+    return;
+  }
+  const view = await buildBookMoveFolderView(bookId);
+  await telegram.editMessageText(chatId, messageId, view.text, { reply_markup: view.reply_markup });
+}
+
+async function handleBookMoveToFolder(chatId, messageId, bookId, folderKey) {
+  const book = await books.getBook(bookId);
+  if (!book) {
+    await telegram.editMessageText(chatId, messageId, '❌ الكتاب ده اتحذف بالفعل.');
+    return;
+  }
+  const folderId = folderKey === bookFolders.UNFILED_KEY ? null : Number(folderKey);
+  await bookFolders.setBookFolder(bookId, folderId);
+  await handleBookMenuButton(chatId, messageId, bookId);
 }
 
 // Puts the admin into "waiting to type the new name" mode for a book.
@@ -1252,6 +1492,7 @@ async function handleBookDeleteConfirmed(chatId, messageId, bookId) {
     return;
   }
   await books.deleteBook(bookId);
+  await bookFolders.removeBookAssignment(bookId);
   await telegram.editMessageText(chatId, messageId, `✅ تم حذف الكتاب "${escapeHtml(book.name)}" (ID: ${bookId}).`, {
     parse_mode: 'HTML',
   });
@@ -1301,6 +1542,25 @@ async function tryHandleAddBookNamePaste(chatId, adminId, text) {
 // questions get answered against, and can change it any time.
 // =========================================================
 
+// Builds the top-level /mybook folder picker (2 folders per row, plus a
+// "بدون مجلد" bucket if any ready book isn't filed into one) from an
+// already-grouped { folders, unfiled } pair — see
+// bookFolders.groupBooksByFolder. Pure/no DB calls so both the initial
+// send and the "🔙 رجوع" callback can reuse it.
+function buildMyBookFoldersView(folders, unfiled) {
+  const folderButtons = folders
+    .filter((f) => f.books.length > 0)
+    .map((f) => ({ text: `📁 ${f.name} (${f.books.length})`, callback_data: `cmd_mybookfolder_${f.id}` }));
+  if (unfiled.length > 0) {
+    folderButtons.push({
+      text: `📂 بدون مجلد (${unfiled.length})`,
+      callback_data: `cmd_mybookfolder_${bookFolders.UNFILED_KEY}`,
+    });
+  }
+  const keyboard = chunkButtons(folderButtons, 2);
+  return { text: '📚 اختار المجلد اللي فيه الكتاب اللي عايزه:', reply_markup: { inline_keyboard: keyboard } };
+}
+
 async function handleMyBookCommand(chatId, userId) {
   const readyBooks = await books.listReadyBooks();
   if (readyBooks.length === 0) {
@@ -1308,16 +1568,63 @@ async function handleMyBookCommand(chatId, userId) {
     return;
   }
 
+  const state = await bookFolders.getFoldersState();
+  const { folders, unfiled } = bookFolders.groupBooksByFolder(readyBooks, state);
+
+  // No folders set up at all yet — keep the old flat one-tap list
+  // instead of forcing an extra "📂 بدون مجلد" tap for a small library.
+  if (folders.length === 0) {
+    const selectedId = await users.getSelectedBookId(userId);
+    const buttons = readyBooks.map((b) => [
+      { text: `${b.id === selectedId ? '✅ ' : ''}${b.name}`, callback_data: `cmd_selectbook_${b.id}` },
+    ]);
+    await telegram.sendMessage(chatId, '📚 اختار الكتاب اللي عايز تدور فيه:', {
+      reply_markup: { inline_keyboard: buttons },
+    });
+    return;
+  }
+
+  const { text, reply_markup } = buildMyBookFoldersView(folders, unfiled);
+  await telegram.sendMessage(chatId, text, { reply_markup });
+}
+
+// Books within one folder (or "بدون مجلد") for the /mybook picker —
+// reached by tapping a folder button from buildMyBookFoldersView.
+// ✅ marks the user's currently selected book, same convention as the
+// old flat list.
+async function handleMyBookFolderButton(chatId, messageId, userId, folderKey) {
+  const readyBooks = await books.listReadyBooks();
+  const state = await bookFolders.getFoldersState();
+  const { folders, unfiled } = bookFolders.groupBooksByFolder(readyBooks, state);
+
+  const isUnfiled = folderKey === bookFolders.UNFILED_KEY;
+  const folder = isUnfiled ? null : folders.find((f) => f.id === Number(folderKey));
+  const booksInFolder = isUnfiled ? unfiled : folder ? folder.books : null;
+  if (booksInFolder == null) {
+    await telegram.editMessageText(chatId, messageId, '❌ المجلد ده مش موجود دلوقت.');
+    return;
+  }
+
   const selectedId = await users.getSelectedBookId(userId);
-  const buttons = readyBooks.map((b) => [
-    {
-      text: `${b.id === selectedId ? '✅ ' : ''}${b.name}`,
-      callback_data: `cmd_selectbook_${b.id}`,
-    },
+  const buttons = booksInFolder.map((b) => [
+    { text: `${b.id === selectedId ? '✅ ' : ''}${b.name}`, callback_data: `cmd_selectbook_${b.id}` },
   ]);
-  await telegram.sendMessage(chatId, '📚 اختار الكتاب اللي عايز تدور فيه:', {
+  buttons.push([{ text: '🔙 رجوع', callback_data: 'cmd_mybookback' }]);
+
+  const title = isUnfiled ? '📂 بدون مجلد' : `📁 ${folder.name}`;
+  await telegram.editMessageText(chatId, messageId, `${title}\nاختار الكتاب اللي عايز تدور فيه:`, {
     reply_markup: { inline_keyboard: buttons },
   });
+}
+
+// "🔙 رجوع" from inside a folder back to the top-level /mybook folder
+// picker.
+async function handleMyBookBackButton(chatId, messageId, userId) {
+  const readyBooks = await books.listReadyBooks();
+  const state = await bookFolders.getFoldersState();
+  const { folders, unfiled } = bookFolders.groupBooksByFolder(readyBooks, state);
+  const { text, reply_markup } = buildMyBookFoldersView(folders, unfiled);
+  await telegram.editMessageText(chatId, messageId, text, { reply_markup });
 }
 
 // DIAGNOSTIC (admin only): /search <كلمة> — raw text search on book_chunks,
@@ -1384,8 +1691,9 @@ async function handleAdminHelp(chatId) {
     `• <code>/stats</code> — إحصائيات عامة (مستخدمين، إجابات محفوظة).\n` +
     `• <code>/user USER_ID</code> — تقرير عن مستخدم معين.\n\n` +
     `📚 <b>إدارة الكتب:</b>\n` +
-    `• <code>/books</code> أو <code>/status</code> — عرض كل الكتب مع أزرار لكل كتاب (تغيير الاسم / حذف) وزر لإضافة كتاب جديد.\n` +
-    `• إضافة/تغيير اسم/حذف كتاب بيتم بالأزرار بس (مفيش أوامر نصية للحاجات دي). لو بعتّ PDF من غير ما تدوس "➕ إضافة كتاب جديد" الأول، هيتعامل معاه كملف أسئلة عادي زي أي مستخدم.\n` +
+    `• <code>/books</code> أو <code>/status</code> — عرض المجلدات (مجلدين في كل صف)، وبالدخول لأي مجلد تشوف الكتب اللي جواه مع أزرار لكل كتاب (تغيير الاسم / نقل لمجلد / حذف).\n` +
+    `• "➕ إضافة مجلد جديد" بيعمل مجلد فاضي تقدر تنقل له أي كتاب بعدين من زر "📁 نقل لمجلد" في قائمة الكتاب. تقدر كمان تغيّر اسم أي مجلد أو تحذفه (حذف المجلد مش بيحذف الكتب اللي جواه، بترجع "بدون مجلد").\n` +
+    `• إضافة/تغيير اسم/حذف كتاب أو مجلد بيتم بالأزرار بس (مفيش أوامر نصية للحاجات دي). لو بعتّ PDF من غير ما تدوس "➕ إضافة كتاب جديد" الأول، هيتعامل معاه كملف أسئلة عادي زي أي مستخدم.\n` +
     `• <code>/search كلمة</code> و <code>/debug سؤال</code> — أدوات تشخيصية على كل الكتب.\n\n` +
     `⚙️ <b>الإعدادات العامة:</b>\n` +
     `• <code>/setwelcome النص</code> — تغيير رسالة الترحيب عند /start.\n` +
@@ -2510,7 +2818,13 @@ async function handleCallbackQuery(cb) {
   // 📚 Admin book management buttons (all admin-only; silently ack for
   // anyone else since these callback_data values only ever get sent to
   // admins in the first place).
-  if (data.startsWith('cmd_book') || data === 'cmd_addbooknew' || data === 'cmd_booksback') {
+  if (
+    data.startsWith('cmd_book') ||
+    data.startsWith('cmd_folder') ||
+    data === 'cmd_addbooknew' ||
+    data === 'cmd_addfoldernew' ||
+    data === 'cmd_booksback'
+  ) {
     if (!isAdmin(userId)) {
       await telegram.answerCallbackQuery(cb.id);
       return;
@@ -2524,6 +2838,35 @@ async function handleCallbackQuery(cb) {
     if (data === 'cmd_addbooknew') {
       await telegram.answerCallbackQuery(cb.id);
       await handleAddBookNewPrompt(chatId, messageId, userId);
+      return;
+    }
+    if (data === 'cmd_addfoldernew') {
+      await telegram.answerCallbackQuery(cb.id);
+      await handleAddFolderNewPrompt(chatId, messageId, userId);
+      return;
+    }
+    if (data.startsWith('cmd_folderopen_')) {
+      const folderKey = data.replace('cmd_folderopen_', '');
+      await telegram.answerCallbackQuery(cb.id);
+      await handleFolderOpenButton(chatId, messageId, folderKey);
+      return;
+    }
+    if (data.startsWith('cmd_folderrename_')) {
+      const folderId = Number(data.replace('cmd_folderrename_', ''));
+      await telegram.answerCallbackQuery(cb.id);
+      await handleFolderRenameStart(chatId, messageId, userId, folderId);
+      return;
+    }
+    if (data.startsWith('cmd_folderdeleteconfirm_')) {
+      const folderId = Number(data.replace('cmd_folderdeleteconfirm_', ''));
+      await telegram.answerCallbackQuery(cb.id, { text: '✅ تم الحذف.' });
+      await handleFolderDeleteConfirmed(chatId, messageId, folderId);
+      return;
+    }
+    if (data.startsWith('cmd_folderdelete_')) {
+      const folderId = Number(data.replace('cmd_folderdelete_', ''));
+      await telegram.answerCallbackQuery(cb.id);
+      await handleFolderDeleteConfirmPrompt(chatId, messageId, folderId);
       return;
     }
     if (data.startsWith('cmd_bookmenu_')) {
@@ -2548,6 +2891,21 @@ async function handleCallbackQuery(cb) {
       const bookId = Number(data.replace('cmd_bookdelete_', ''));
       await telegram.answerCallbackQuery(cb.id);
       await handleBookDeleteConfirmPrompt(chatId, messageId, bookId);
+      return;
+    }
+    if (data.startsWith('cmd_bookmovefolder_')) {
+      const bookId = Number(data.replace('cmd_bookmovefolder_', ''));
+      await telegram.answerCallbackQuery(cb.id);
+      await handleBookMoveFolderPrompt(chatId, messageId, bookId);
+      return;
+    }
+    if (data.startsWith('cmd_bookmoveto_')) {
+      const rest = data.slice('cmd_bookmoveto_'.length);
+      const sepIdx = rest.indexOf('_');
+      const bookId = Number(rest.slice(0, sepIdx));
+      const folderKey = rest.slice(sepIdx + 1);
+      await telegram.answerCallbackQuery(cb.id, { text: '✅ تم النقل.' });
+      await handleBookMoveToFolder(chatId, messageId, bookId, folderKey);
       return;
     }
   }
@@ -2896,6 +3254,19 @@ if (data.startsWith('ansclr_')) {
     return;
   }
 
+
+  if (data.startsWith('cmd_mybookfolder_')) {
+    const folderKey = data.replace('cmd_mybookfolder_', '');
+    await telegram.answerCallbackQuery(cb.id);
+    await handleMyBookFolderButton(chatId, messageId, userId, folderKey);
+    return;
+  }
+
+  if (data === 'cmd_mybookback') {
+    await telegram.answerCallbackQuery(cb.id);
+    await handleMyBookBackButton(chatId, messageId, userId);
+    return;
+  }
 
   if (data.startsWith('cmd_selectbook_')) {
     const bookId = Number(data.replace('cmd_selectbook_', ''));
@@ -3395,20 +3766,34 @@ module.exports = async (req, res) => {
         // /addkey is pending), otherwise treat it as a batch of questions.
         const handledAsBookRename = admin && (await tryHandleBookRenamePaste(chatId, fromUser.id, text));
         const handledAsNewBookName = !handledAsBookRename && admin && (await tryHandleAddBookNamePaste(chatId, fromUser.id, text));
+        const handledAsNewFolderName =
+          !handledAsBookRename && !handledAsNewBookName && admin && (await tryHandleAddFolderNamePaste(chatId, fromUser.id, text));
+        const handledAsFolderRename =
+          !handledAsBookRename &&
+          !handledAsNewBookName &&
+          !handledAsNewFolderName &&
+          admin &&
+          (await tryHandleFolderRenamePaste(chatId, fromUser.id, text));
         const handledAsAddBlockMinute =
           !handledAsBookRename &&
           !handledAsNewBookName &&
+          !handledAsNewFolderName &&
+          !handledAsFolderRename &&
           admin &&
           (await tryHandleAddBlockMinutePaste(chatId, fromUser.id, text));
         const handledAsAddBlockLabel =
           !handledAsBookRename &&
           !handledAsNewBookName &&
+          !handledAsNewFolderName &&
+          !handledAsFolderRename &&
           !handledAsAddBlockMinute &&
           admin &&
           (await tryHandleAddBlockLabelPaste(chatId, fromUser.id, text));
         const handledAsPdfAddUser =
           !handledAsBookRename &&
           !handledAsNewBookName &&
+          !handledAsNewFolderName &&
+          !handledAsFolderRename &&
           !handledAsAddBlockMinute &&
           !handledAsAddBlockLabel &&
           admin &&
@@ -3416,6 +3801,8 @@ module.exports = async (req, res) => {
         const handledAsKeyPaste =
           !handledAsBookRename &&
           !handledAsNewBookName &&
+          !handledAsNewFolderName &&
+          !handledAsFolderRename &&
           !handledAsAddBlockMinute &&
           !handledAsAddBlockLabel &&
           !handledAsPdfAddUser &&
@@ -3423,6 +3810,8 @@ module.exports = async (req, res) => {
         if (
           !handledAsBookRename &&
           !handledAsNewBookName &&
+          !handledAsNewFolderName &&
+          !handledAsFolderRename &&
           !handledAsAddBlockMinute &&
           !handledAsAddBlockLabel &&
           !handledAsPdfAddUser &&
