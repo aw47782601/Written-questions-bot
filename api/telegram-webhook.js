@@ -8,7 +8,7 @@ const {
   extractQuestionsFromPlainTextBuffer,
   extractQuestionsFromText,
 } = require('../lib/questionExtractor');
-const { answerQuestions } = require('../lib/batchAnswer');
+const { answerQuestions, formatUserAnswers } = require('../lib/batchAnswer');
 const collectSession = require('../lib/collectSession');
 const pdfDesigns = require('../lib/pdfDesigns');
 const pdfAccess = require('../lib/pdfAccess');
@@ -690,9 +690,17 @@ async function deliverResults(chatId, results, book, fromUser, format, designId,
 //      (see buildEditedResults below for the exact syntax): "<رقم>:
 //      <صياغة جديدة>" to reword, "add <رقم>: <نص السؤال>" to insert a new
 //      question at that exact position (shifting everything after it down
-//      by one), or "delete <رقم>" to remove a question entirely. Only the
-//      reworded/added questions actually get (re-)answered by Gemini;
-//      deletes cost nothing.
+//      by one), "delete <رقم>" to remove a question entirely, or
+//      "answer <رقم>: <إجابتك بنفسك>" to REPLACE the AI-generated answer
+//      with the user's own answer (see buildFormatPrompt/formatUserAnswers
+//      in lib/batchAnswer.js) — Gemini is only asked to FORMAT that text
+//      (split into points, build a comparison table, bold key terms), never
+//      to re-derive or fact-check it against the book, and no RAG/embedding
+//      call happens for it at all. The answer body may span multiple
+//      lines: everything after "answer <رقم>:" up to the next recognized
+//      command line (or the end of the message) belongs to that answer.
+//      Only the reworded/added/user-answered questions actually trigger a
+//      Gemini call; deletes cost nothing.
 // Every path merges the change(s) back into the full results array (no
 // separate reordering step needed — buildEditedResults already produces
 // the final order), then redelivers the complete, updated set — so the
@@ -738,16 +746,45 @@ async function offerRetryReword(chatId, fromUser, book, results, format, designI
 // admin report for just this follow-up action, then re-stages the updated
 // results so the buttons can be used again (e.g. reword one question, then
 // later retry/reword another).
+// True if a (trimmed) line starts a new recognized edit command — used by
+// parseEditLines below to know where a multi-line "answer <رقم>: ..." body
+// ends (it swallows every following line that ISN'T one of these until the
+// next command or the end of the message).
+function isEditCommandLine(rawLine) {
+  const line = (rawLine || '').trim();
+  if (!line) return false;
+  return (
+    /^add\s+\d+\s*[:\-]/i.test(line) ||
+    /^delete\s+\d+\s*$/i.test(line) ||
+    /^answer\s+\d+\s*[:\-]/i.test(line) ||
+    /^\d+\s*[:\-]/.test(line)
+  );
+}
+
 // Parses the free-text reply to the ✏️➕➖ button into a list of edit
-// operations. Each line must be one of:
+// operations. Each line starts one of:
 //   "<number>: <new wording>"   → REWORD the question currently at that
-//                                  position with new wording.
+//                                  position with new wording (Gemini
+//                                  re-derives the answer from the book).
 //   "add <number>: <question>"  → ADD a brand-new question so it lands
 //                                  EXACTLY at that position (shifting the
 //                                  question that used to be there, and
 //                                  everything after it, down by one).
 //   "delete <number>"           → DELETE the question at that position
 //                                  entirely (no Gemini call needed).
+//   "answer <number>: <text>"   → REPLACE the answer at that position with
+//                                  the user's OWN text (Gemini only
+//                                  FORMATS it — see formatUserAnswers in
+//                                  lib/batchAnswer.js — never re-derives or
+//                                  fact-checks it, and no RAG/embedding
+//                                  call happens for it). Unlike the other
+//                                  three, this one's body can span MULTIPLE
+//                                  lines: everything after "answer <n>:" on
+//                                  its own line, up through any following
+//                                  lines that aren't themselves a new edit
+//                                  command, is treated as that answer's
+//                                  full text (so a multi-paragraph or
+//                                  multi-point answer works fine).
 // All <number>s refer to the ORIGINAL numbering the user was just shown
 // (batch.results, before any of these edits are applied) — not a
 // running/shifting count as edits are processed one by one. That's what
@@ -757,10 +794,14 @@ function parseEditLines(text, resultsLength) {
   const rewords = new Map(); // 0-based idx -> new question text
   const deletes = new Set(); // 0-based idx
   const adds = []; // { atIndex (0-based, insert BEFORE this original position), question }
+  const userAnswers = new Map(); // 0-based idx -> user-written answer text (verbatim content, to be formatted only)
 
-  text.split('\n').forEach((rawLine) => {
-    const line = rawLine.trim();
-    if (!line) return;
+  const lines = text.split('\n');
+  let i = 0;
+  while (i < lines.length) {
+    const line = lines[i].trim();
+    i += 1;
+    if (!line) continue;
 
     const addMatch = line.match(/^add\s+(\d+)\s*[:\-]\s*(.+)$/i);
     if (addMatch) {
@@ -769,14 +810,30 @@ function parseEditLines(text, resultsLength) {
       // Valid target positions are 0..resultsLength (resultsLength itself
       // means "insert as the new last question").
       if (pos >= 0 && pos <= resultsLength && question) adds.push({ atIndex: pos, question });
-      return;
+      continue;
     }
 
     const deleteMatch = line.match(/^delete\s+(\d+)\s*$/i);
     if (deleteMatch) {
       const idx = Number(deleteMatch[1]) - 1;
       if (idx >= 0 && idx < resultsLength) deletes.add(idx);
-      return;
+      continue;
+    }
+
+    const answerMatch = line.match(/^answer\s+(\d+)\s*[:\-]\s*(.*)$/i);
+    if (answerMatch) {
+      const idx = Number(answerMatch[1]) - 1;
+      const bodyLines = [];
+      if (answerMatch[2].trim()) bodyLines.push(answerMatch[2].trim());
+      // Swallow every following line that isn't itself a new edit command —
+      // that's what lets the user's own answer span multiple lines/paragraphs.
+      while (i < lines.length && !isEditCommandLine(lines[i])) {
+        bodyLines.push(lines[i]);
+        i += 1;
+      }
+      const body = bodyLines.join('\n').trim();
+      if (idx >= 0 && idx < resultsLength && body) userAnswers.set(idx, body);
+      continue;
     }
 
     const rewordMatch = line.match(/^(\d+)\s*[:\-]\s*(.+)$/);
@@ -785,18 +842,24 @@ function parseEditLines(text, resultsLength) {
       const newText = rewordMatch[2].trim();
       if (idx >= 0 && idx < resultsLength && newText) rewords.set(idx, newText);
     }
-  });
+  }
 
-  return { rewords, deletes, adds };
+  return { rewords, deletes, adds, userAnswers };
 }
 
 // Builds the ordered "plan" for the final results array from the parsed
-// edits: existing (untouched) items pass through as-is; reworded/added
-// items are left as { needsAnswer: true, question, chapter } placeholders
-// to be answered in ONE combined Gemini batch call by the caller, then
-// spliced back in. Deletes simply aren't included in the output.
-// A delete on an index wins over a reword of that same index (a question
-// that's being removed doesn't need its wording touched).
+// edits. Each plan item has a `kind`:
+//   'answer'      — reworded or newly-added question; { question, chapter }
+//                    needs a full RAG + Gemini answer call (answerQuestions).
+//   'format'      — "answer <رقم>: ..." edit; { question, rawAnswer,
+//                    original } needs only a Gemini FORMATTING call
+//                    (formatUserAnswers) over the user's own text — no RAG.
+//   'passthrough' — untouched item; { item } is reused as-is.
+// Deletes simply aren't included in the output. Precedence for a single
+// index that matches more than one edit: delete wins over everything
+// (nothing left to touch); otherwise a user-written "answer" wins over a
+// plain reword (the more specific instruction — "use my own answer" — takes
+// priority over "reword the question and let AI re-answer it").
 function buildEditedResults(originalResults, edits) {
   const addsByPos = new Map();
   edits.adds.forEach(({ atIndex, question }) => {
@@ -814,15 +877,22 @@ function buildEditedResults(originalResults, edits) {
       // lib/pdfGenerator.js's chapter banners stay sensible.
       const chapter = i < n ? originalResults[i]?.chapter ?? null : originalResults[n - 1]?.chapter ?? null;
       addsByPos.get(i).forEach((question) => {
-        plan.push({ needsAnswer: true, question, chapter });
+        plan.push({ kind: 'answer', question, chapter });
       });
     }
     if (i < n) {
       if (edits.deletes.has(i)) continue;
-      if (edits.rewords.has(i)) {
-        plan.push({ needsAnswer: true, question: edits.rewords.get(i), chapter: originalResults[i].chapter ?? null });
+      if (edits.userAnswers.has(i)) {
+        plan.push({
+          kind: 'format',
+          question: originalResults[i].question,
+          rawAnswer: edits.userAnswers.get(i),
+          original: originalResults[i],
+        });
+      } else if (edits.rewords.has(i)) {
+        plan.push({ kind: 'answer', question: edits.rewords.get(i), chapter: originalResults[i].chapter ?? null });
       } else {
-        plan.push({ needsAnswer: false, item: originalResults[i] });
+        plan.push({ kind: 'passthrough', item: originalResults[i] });
       }
     }
   }
@@ -3189,7 +3259,7 @@ module.exports = async (req, res) => {
         }
 
         const edits = parseEditLines(text, batch.results.length);
-        const editCount = edits.rewords.size + edits.deletes.size + edits.adds.length;
+        const editCount = edits.rewords.size + edits.deletes.size + edits.adds.length + edits.userAnswers.size;
 
         if (editCount === 0) {
           // Keep waiting — restore the pending state and ask again rather
@@ -3200,7 +3270,8 @@ module.exports = async (req, res) => {
             '⚠️ مقدرتش ألاقي صيغة صحيحة. استخدم واحد من الأشكال دي، سطر لكل تعديل:\n' +
               '<رقم>: <الصياغة الجديدة>\n' +
               'add <رقم>: <نص السؤال الجديد>\n' +
-              'delete <رقم>'
+              'delete <رقم>\n' +
+              'answer <رقم>: <إجابتك بنفسك>'
           );
           res.status(200).json({ ok: true });
           return;
@@ -3217,6 +3288,7 @@ module.exports = async (req, res) => {
         if (edits.rewords.size > 0) summaryParts.push(`تعديل ${edits.rewords.size}`);
         if (edits.adds.length > 0) summaryParts.push(`إضافة ${edits.adds.length}`);
         if (edits.deletes.size > 0) summaryParts.push(`حذف ${edits.deletes.size}`);
+        if (edits.userAnswers.size > 0) summaryParts.push(`استبدال إجابة ${edits.userAnswers.size} بإجابتك`);
         await telegram.sendMessage(chatId, `✏️➕➖ جاري تنفيذ: ${summaryParts.join('، ')}...`);
 
         const usage = {
@@ -3231,12 +3303,36 @@ module.exports = async (req, res) => {
         if (ownKeys.length >= MIN_USER_KEYS_FOR_BOOST) extraKeys = ownKeys.map((k) => k.api_key);
 
         const plan = buildEditedResults(batch.results, edits);
-        const toAnswer = plan.filter((p) => p.needsAnswer).map((p) => ({ question: p.question, chapter: p.chapter }));
-        // toAnswer can be empty (a message that's ONLY deletes needs no
-        // Gemini call at all — skip straight to the merge).
-        const answered = toAnswer.length > 0 ? await answerQuestions(toAnswer, book.id, extraKeys, usage) : [];
+        const toAnswer = plan.filter((p) => p.kind === 'answer').map((p) => ({ question: p.question, chapter: p.chapter }));
+        const toFormat = plan
+          .filter((p) => p.kind === 'format')
+          .map((p) => ({ question: p.question, rawAnswer: p.rawAnswer }));
+        // Both calls run in parallel — toAnswer (reword/add) needs a full
+        // RAG + Gemini answer; toFormat ("answer <رقم>: ...") only needs
+        // Gemini to format the user's own text, no RAG at all. A message
+        // that's ONLY deletes triggers neither and needs no Gemini call.
+        const [answered, formatted] = await Promise.all([
+          toAnswer.length > 0 ? answerQuestions(toAnswer, book.id, extraKeys, usage) : [],
+          toFormat.length > 0 ? formatUserAnswers(toFormat, extraKeys, usage) : [],
+        ]);
         let ai = 0;
-        const merged = plan.map((p) => (p.needsAnswer ? answered[ai++] : p.item));
+        let fi = 0;
+        const merged = plan.map((p) => {
+          if (p.kind === 'answer') return answered[ai++];
+          if (p.kind === 'format') {
+            const f = formatted[fi++];
+            // Keep the original question/page/chapter/image — only the
+            // answer content (and its comparison-table shape) changes.
+            return {
+              ...p.original,
+              answer: f.answer,
+              isComparison: f.isComparison,
+              comparisonTable: f.comparisonTable,
+              isError: f.isError,
+            };
+          }
+          return p.item;
+        });
 
         await finalizeRetryOrReword(
           chatId,
