@@ -309,6 +309,31 @@ async function handleBookUpload(chatId, adminId, fileId, fileName, caption) {
   }
 }
 
+// /continue_book <id> — picks up a book's image-captioning pass exactly
+// where a Vercel timeout (or dead quota) left it, without re-rendering
+// or re-embedding anything that already succeeded. See
+// lib/books.js continueBookImages for the actual resume logic; this is
+// just the Telegram-facing wrapper, same progress-relay pattern as
+// handleBookUpload above.
+async function handleContinueBook(chatId, bookIdRaw) {
+  const bookId = Number(bookIdRaw);
+  if (!bookIdRaw || Number.isNaN(bookId)) {
+    await telegram.sendMessage(chatId, 'استخدم: /continue_book <ID الكتاب>\nهتلاقي الـ ID في /books.');
+    return;
+  }
+
+  await telegram.sendMessage(chatId, `🔄 بكمل معالجة صور الكتاب #${bookId}...`);
+  try {
+    const result = await books.continueBookImages(bookId, (msg) => telegram.sendMessage(chatId, msg));
+    if (result.skipped) {
+      await telegram.sendMessage(chatId, 'خاصية قراءة الصور (ENABLE_IMAGE_CHUNKS) مقفولة أصلاً.');
+    }
+  } catch (err) {
+    console.error(`/continue_book failed for book ${bookId}:`, err);
+    await telegram.sendMessage(chatId, `❌ فشل إكمال الكتاب #${bookId}:\n${err.message}`);
+  }
+}
+
 // Resolves which book to answer against for this user. Auto-selects and
 // persists when there's exactly one ready book (so solo-book deployments
 // need zero extra steps from users). When there are 0 or 2+ ready books,
@@ -1648,7 +1673,8 @@ async function handleAdminHelp(chatId) {
     `• <code>/books</code> أو <code>/status</code> — عرض المجلدات (مجلدين في كل صف)، وبالدخول لأي مجلد تشوف الكتب اللي جواه مع أزرار لكل كتاب (تغيير الاسم / نقل لمجلد / حذف).\n` +
     `• "➕ إضافة مجلد جديد" بيعمل مجلد فاضي تقدر تنقل له أي كتاب بعدين من زر "📁 نقل لمجلد" في قائمة الكتاب. تقدر كمان تغيّر اسم أي مجلد أو تحذفه (حذف المجلد مش بيحذف الكتب اللي جواه، بترجع "بدون مجلد").\n` +
     `• إضافة/تغيير اسم/حذف كتاب أو مجلد بيتم بالأزرار بس (مفيش أوامر نصية للحاجات دي). لو بعتّ PDF من غير ما تدوس "➕ إضافة كتاب جديد" الأول، هيتعامل معاه كملف أسئلة عادي زي أي مستخدم.\n` +
-    `• <code>/search كلمة</code> و <code>/debug سؤال</code> — أدوات تشخيصية على كل الكتب.\n\n` +
+    `• <code>/search كلمة</code> و <code>/debug سؤال</code> — أدوات تشخيصية على كل الكتب.\n` +
+    `• <code>/continue_book ID</code> — لو رفع كتاب فيه صور كتير والمعالجة اتقطعت (مهلة الـ 300 ثانية بتاعة Vercel، أو الكوتة خلصت)، الأمر ده بيكمل بالظبط من اللي فاضل من غير ما يعيد أي صورة خلصت. الـ ID موجود في /books.\n\n` +
     `⚙️ <b>الإعدادات العامة:</b>\n` +
     `• <code>/setwelcome النص</code> — تغيير رسالة الترحيب عند /start.\n` +
     `• <code>/setalert النص</code> — تنبيه عام يظهر لكل مستخدم مرة واحدة.\n\n` +
@@ -3399,6 +3425,10 @@ async function tryHandleAdminCommand(chatId, adminId, text) {
   }
   if (text === '/removeblock') {
     await handleRemoveBlockPrompt(chatId);
+    return true;
+  }
+  if (text.startsWith('/continue_book ')) {
+    await handleContinueBook(chatId, text.replace('/continue_book ', '').trim());
     return true;
   }
   return false;
