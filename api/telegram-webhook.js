@@ -297,12 +297,23 @@ async function handleBookUpload(chatId, adminId, fileId, fileName, caption) {
     const summary = await books.ingestNewBook(buffer, fileName, bookName, (msg) =>
       telegram.sendMessage(chatId, msg)
     );
-    await telegram.sendMessage(
-      chatId,
+    const totalChunks = summary.chunks + (summary.imageChunks || 0);
+    const hasFailedImages = (summary.failedImages || 0) > 0;
+    let doneMsg =
       `✅ تم تجهيز الكتاب "${bookName}" بنجاح (ID: ${summary.id}).\n` +
-        `عدد الصفحات: ${summary.pages}\nعدد الأجزاء القابلة للبحث: ${summary.chunks}\n\n` +
-        `المستخدمين هيقدروا يختاروه عبر /mybook.`
-    );
+      `عدد الصفحات: ${summary.pages}\n` +
+      `عدد أجزاء النص: ${summary.chunks}\n`;
+    if (summary.totalImages > 0) {
+      doneMsg += `صور اتعالجت بنجاح (وصف حقيقي): ${summary.imageChunks}/${summary.totalImages}\n`;
+    }
+    doneMsg += `إجمالي الأجزاء القابلة للبحث: ${totalChunks}\n\n`;
+    if (hasFailedImages) {
+      doneMsg +=
+        `⚠️ ملحوظة: ${summary.failedImages} صورة اتحفظت من غير وصف حقيقي (غالبًا بسبب quota Gemini) — ` +
+        `شغّل /continue_book ${summary.id} لاحقًا عشان يتعاد توليد الوصف الصح ليها.\n\n`;
+    }
+    doneMsg += `المستخدمين هيقدروا يختاروه عبر /mybook.`;
+    await telegram.sendMessage(chatId, doneMsg);
   } catch (err) {
     console.error('Book ingestion failed:', err);
     await telegram.sendMessage(chatId, `❌ فشلت معالجة الكتاب "${bookName}":\n${err.message}`);
