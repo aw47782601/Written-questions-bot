@@ -345,6 +345,35 @@ async function handleContinueBook(chatId, bookIdRaw) {
   }
 }
 
+// /fix_legacy_images [bookId] — backfills book_chunks image rows that
+// predate the pending/caption_failed status system: they still have
+// their original rendered page bytes in image_base64, but content is
+// still the hard-coded failed-caption placeholder and image_status is
+// null, so /continue_book (which filters on image_status) can't find or
+// resume them. See lib/books.js fixLegacyFailedImages for the actual
+// logic — this never needs source_pdf_path, so it also works for books
+// whose original PDF was never saved (storeSourcePdf failure).
+// bookId is optional: omit it to sweep the backlog across every book in
+// one call.
+async function handleFixLegacyImages(chatId, bookIdRaw) {
+  const bookId = bookIdRaw ? Number(bookIdRaw) : null;
+  if (bookIdRaw && Number.isNaN(bookId)) {
+    await telegram.sendMessage(chatId, 'استخدم: /fix_legacy_images [ID الكتاب]\nسيب الـ ID فاضي عشان تصلح كل الكتب مرة واحدة.');
+    return;
+  }
+
+  await telegram.sendMessage(
+    chatId,
+    `🔧 بدأت إصلاح الصور القديمة الفاشلة${bookId ? ` لكتاب #${bookId}` : ' لكل الكتب'}...`
+  );
+  try {
+    await books.fixLegacyFailedImages(bookId, (msg) => telegram.sendMessage(chatId, msg));
+  } catch (err) {
+    console.error('/fix_legacy_images failed:', err);
+    await telegram.sendMessage(chatId, `❌ فشل إصلاح الصور القديمة:\n${err.message}`);
+  }
+}
+
 // Resolves which book to answer against for this user. Auto-selects and
 // persists when there's exactly one ready book (so solo-book deployments
 // need zero extra steps from users). When there are 0 or 2+ ready books,
@@ -1686,6 +1715,7 @@ async function handleAdminHelp(chatId) {
     `• إضافة/تغيير اسم/حذف كتاب أو مجلد بيتم بالأزرار بس (مفيش أوامر نصية للحاجات دي). لو بعتّ PDF من غير ما تدوس "➕ إضافة كتاب جديد" الأول، هيتعامل معاه كملف أسئلة عادي زي أي مستخدم.\n` +
     `• <code>/search كلمة</code> و <code>/debug سؤال</code> — أدوات تشخيصية على كل الكتب.\n` +
     `• <code>/continue_book ID</code> — لو رفع كتاب فيه صور كتير والمعالجة اتقطعت (مهلة الـ 300 ثانية بتاعة Vercel، أو الكوتة خلصت)، الأمر ده بيكمل بالظبط من اللي فاضل من غير ما يعيد أي صورة خلصت. الـ ID موجود في /books.\n\n` +
+    `• <code>/fix_legacy_images [ID]</code> — بيصلح صفوف صور قديمة فشل توليد وصفها زمان (لسه محفوظ معاها نسخة الصورة نفسها) من غير ما يحتاج يرجع للـ PDF الأصلي. سيب الـ ID فاضي عشان يشتغل على كل الكتب مرة واحدة. بيشتغل على دفعات ويكمل من نفسه لو اتقطع أو رجّعته تاني — والصف بيتحسب "اتصلح" بس لو فعلاً طلع وصف حقيقي، مش لو فشل تاني.\n\n` +
     `⚙️ <b>الإعدادات العامة:</b>\n` +
     `• <code>/setwelcome النص</code> — تغيير رسالة الترحيب عند /start.\n` +
     `• <code>/setalert النص</code> — تنبيه عام يظهر لكل مستخدم مرة واحدة.\n\n` +
@@ -3440,6 +3470,10 @@ async function tryHandleAdminCommand(chatId, adminId, text) {
   }
   if (text.startsWith('/continue_book ')) {
     await handleContinueBook(chatId, text.replace('/continue_book ', '').trim());
+    return true;
+  }
+  if (text === '/fix_legacy_images' || text.startsWith('/fix_legacy_images ')) {
+    await handleFixLegacyImages(chatId, text.replace('/fix_legacy_images', '').trim());
     return true;
   }
   return false;
