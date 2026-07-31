@@ -149,22 +149,27 @@ function formatResults(results) {
 
 // A question "wasn't answered" when Gemini couldn't match it to any real
 // book content (page === null — includes both the "مش واضحة" fallback
-// text and the isError retry-message case) — see lib/batchAnswer.js. Those
-// get moved to the END of the array, after every genuinely-answered
-// question, so the numbering the user sees (Q1, Q2, ... in both the PDF
-// and the text reply) stays a clean, undisturbed sequence for the
-// questions that DID get answered, with the unanswered one(s) trailing
-// after with whatever numbers are left — instead of an unanswered
-// question in the middle of the batch bumping every later question's
-// number for no useful reason. Order is otherwise preserved (stable
-// partition), both among the answered and among the unanswered items.
-function reorderUnansweredLast(results) {
-  const answered = [];
-  const unanswered = [];
-  results.forEach((r) => {
-    (r.isError || r.page === null ? unanswered : answered).push(r);
+// text and the isError retry-message case) — see lib/batchAnswer.js.
+// These stay in their ORIGINAL position in the results array (and so in
+// the PDF/text reply too) — Q1, Q2, ... is simply the order the
+// questions were asked in, unanswered ones included, instead of being
+// pushed to the end. See buildUnansweredNumbersLine below for how the
+// user is told WHICH numbers came back unanswered.
+function isUnanswered(r) {
+  return r.isError || r.page === null;
+}
+
+// Given the FINAL results array (same order as the PDF/text reply, so
+// index + 1 lines up with the "Q<n>" badge the user sees on each card),
+// returns the 1-based question numbers that came back unanswered, e.g.
+// [3, 7, 9] — used to build the "❌ الأسئلة اللي من غير إجابة: ..." line
+// in the delivery caption instead of the PDF trailing them at the end.
+function unansweredQuestionNumbers(results) {
+  const numbers = [];
+  results.forEach((r, idx) => {
+    if (isUnanswered(r)) numbers.push(idx + 1);
   });
-  return [...answered, ...unanswered];
+  return numbers;
 }
 
 // Converts already-escaped-safe raw text into HTML, turning Gemini's
@@ -698,15 +703,16 @@ async function deliverResults(chatId, results, book, fromUser, format, designId,
         // AND Gemini matched it to real book content (page !== null).
         const totalCount = results.length;
         const answeredCount = results.filter((r) => !r.isError && r.page !== null).length;
-        const unansweredCount = totalCount - answeredCount;
-        // The M.E.M design (design_1) no longer renders unanswered
-        // questions as trailing cards inside the PDF itself (see
-        // lib/pdfGenerator.js) — so instead of the user finding them
-        // tacked on at the end, the caption calls out how many were left
-        // unanswered right here, at delivery time.
+        // Unanswered questions stay in their original position inside
+        // the PDF (see isUnanswered/unansweredQuestionNumbers above)
+        // instead of being moved to the end — so instead of the user
+        // having to scan the whole PDF to find them, the caption calls
+        // out exactly which Q<n> numbers came back unanswered right here,
+        // at delivery time.
+        const unansweredNums = unansweredQuestionNumbers(results);
         const unansweredLine =
-          effectiveDesignId === 'design_1' && unansweredCount > 0
-            ? `\n❌ ${unansweredCount} سؤال من غير إجابة (متسجلّش في الـ PDF)`
+          unansweredNums.length > 0
+            ? `\n❌ الأسئلة اللي من غير إجابة: ${unansweredNums.map((n) => `Q${n}`).join('، ')}`
             : '';
         await telegram.sendDocument(chatId, pdfBuffer, pdfFilename, {
           caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"\n✅ تم الإجابة على ${answeredCount} من ${totalCount} سؤال${unansweredLine}`,
@@ -1089,10 +1095,11 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
       }
     }
     const rawResults = await answerQuestions(questions, book.id, extraKeys, usage);
-    // Push any unanswered question(s) to the end so Q1, Q2, ... stays a
-    // clean, undisturbed sequence for the ones that DID get answered (see
-    // reorderUnansweredLast above).
-    const results = reorderUnansweredLast(rawResults);
+    // Unanswered questions now stay exactly where they were asked (see
+    // isUnanswered/unansweredQuestionNumbers above) instead of being
+    // pushed to the end — the PDF/text reply's Q<n> numbering is simply
+    // the original question order.
+    const results = rawResults;
 
     const { pdfSent, generatedPdfBuffer: pdfBuf, generatedPdfFilename: pdfName, wantsPdf } = await deliverResults(
       chatId,
