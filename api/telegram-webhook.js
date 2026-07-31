@@ -698,8 +698,18 @@ async function deliverResults(chatId, results, book, fromUser, format, designId,
         // AND Gemini matched it to real book content (page !== null).
         const totalCount = results.length;
         const answeredCount = results.filter((r) => !r.isError && r.page !== null).length;
+        const unansweredCount = totalCount - answeredCount;
+        // The M.E.M design (design_1) no longer renders unanswered
+        // questions as trailing cards inside the PDF itself (see
+        // lib/pdfGenerator.js) — so instead of the user finding them
+        // tacked on at the end, the caption calls out how many were left
+        // unanswered right here, at delivery time.
+        const unansweredLine =
+          effectiveDesignId === 'design_1' && unansweredCount > 0
+            ? `\n❌ ${unansweredCount} سؤال من غير إجابة (متسجلّش في الـ PDF)`
+            : '';
         await telegram.sendDocument(chatId, pdfBuffer, pdfFilename, {
-          caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"\n✅ تم الإجابة على ${answeredCount} من ${totalCount} سؤال`,
+          caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"\n✅ تم الإجابة على ${answeredCount} من ${totalCount} سؤال${unansweredLine}`,
         });
         pdfSent = true;
         generatedPdfBuffer = pdfBuffer;
