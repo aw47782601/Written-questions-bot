@@ -320,16 +320,36 @@ async function handleBookUpload(chatId, adminId, fileId, fileName, caption) {
   }
 }
 
-// /continue_book <id> — picks up a book's image-captioning pass exactly
+// /continue_book [id] — picks up a book's image-captioning pass exactly
 // where a Vercel timeout (or dead quota) left it, without re-rendering
 // or re-embedding anything that already succeeded. See
 // lib/books.js continueBookImages for the actual resume logic; this is
 // just the Telegram-facing wrapper, same progress-relay pattern as
 // handleBookUpload above.
+//
+// bookId is now optional: leave it out and lib/books.js
+// continueAllUnfinishedBooks scans every book for unfinished image rows
+// and resumes each one automatically, one after another, sharing a
+// single time budget — no need to look up every half-done book's ID in
+// /books first.
 async function handleContinueBook(chatId, bookIdRaw) {
+  if (!bookIdRaw) {
+    await telegram.sendMessage(chatId, '🔄 مفيش ID متحدد — بدور على كل الكتب اللي فيها صور محتاجة إكمال وبكملهم...');
+    try {
+      const result = await books.continueAllUnfinishedBooks((msg) => telegram.sendMessage(chatId, msg));
+      if (result.skipped) {
+        await telegram.sendMessage(chatId, 'خاصية قراءة الصور (ENABLE_IMAGE_CHUNKS) مقفولة أصلاً.');
+      }
+    } catch (err) {
+      console.error('/continue_book (all books) failed:', err);
+      await telegram.sendMessage(chatId, `❌ فشل إكمال الكتب:\n${err.message}`);
+    }
+    return;
+  }
+
   const bookId = Number(bookIdRaw);
-  if (!bookIdRaw || Number.isNaN(bookId)) {
-    await telegram.sendMessage(chatId, 'استخدم: /continue_book <ID الكتاب>\nهتلاقي الـ ID في /books.');
+  if (Number.isNaN(bookId)) {
+    await telegram.sendMessage(chatId, 'استخدم: /continue_book [ID الكتاب]\nهتلاقي الـ ID في /books، أو سيبه فاضي عشان يكمل كل الكتب المحتاجة.');
     return;
   }
 
@@ -1714,7 +1734,8 @@ async function handleAdminHelp(chatId) {
     `• "➕ إضافة مجلد جديد" بيعمل مجلد فاضي تقدر تنقل له أي كتاب بعدين من زر "📁 نقل لمجلد" في قائمة الكتاب. تقدر كمان تغيّر اسم أي مجلد أو تحذفه (حذف المجلد مش بيحذف الكتب اللي جواه، بترجع "بدون مجلد").\n` +
     `• إضافة/تغيير اسم/حذف كتاب أو مجلد بيتم بالأزرار بس (مفيش أوامر نصية للحاجات دي). لو بعتّ PDF من غير ما تدوس "➕ إضافة كتاب جديد" الأول، هيتعامل معاه كملف أسئلة عادي زي أي مستخدم.\n` +
     `• <code>/search كلمة</code> و <code>/debug سؤال</code> — أدوات تشخيصية على كل الكتب.\n` +
-    `• <code>/continue_book ID</code> — لو رفع كتاب فيه صور كتير والمعالجة اتقطعت (مهلة الـ 300 ثانية بتاعة Vercel، أو الكوتة خلصت)، الأمر ده بيكمل بالظبط من اللي فاضل من غير ما يعيد أي صورة خلصت. الـ ID موجود في /books.\n\n` +
+    `• <code>/continue_book ID</code> — لو رفع كتاب فيه صور كتير والمعالجة اتقطعت (مهلة الـ 300 ثانية بتاعة Vercel، أو الكوتة خلصت)، الأمر ده بيكمل بالظبط من اللي فاضل من غير ما يعيد أي صورة خلصت. الـ ID موجود في /books.\n` +
+    `• <code>/continue_book</code> (من غير ID) — بيدور بنفسه على كل الكتب اللي لسه فيها صور محتاجة إكمال وبيكملهم واحد ورا التاني.\n\n` +
     `• <code>/fix_legacy_images [ID]</code> — بيصلح صفوف صور قديمة فشل توليد وصفها زمان (لسه محفوظ معاها نسخة الصورة نفسها) من غير ما يحتاج يرجع للـ PDF الأصلي. سيب الـ ID فاضي عشان يشتغل على كل الكتب مرة واحدة. بيشتغل على دفعات ويكمل من نفسه لو اتقطع أو رجّعته تاني — والصف بيتحسب "اتصلح" بس لو فعلاً طلع وصف حقيقي، مش لو فشل تاني.\n\n` +
     `⚙️ <b>الإعدادات العامة:</b>\n` +
     `• <code>/setwelcome النص</code> — تغيير رسالة الترحيب عند /start.\n` +
@@ -3468,8 +3489,8 @@ async function tryHandleAdminCommand(chatId, adminId, text) {
     await handleRemoveBlockPrompt(chatId);
     return true;
   }
-  if (text.startsWith('/continue_book ')) {
-    await handleContinueBook(chatId, text.replace('/continue_book ', '').trim());
+  if (text === '/continue_book' || text.startsWith('/continue_book ')) {
+    await handleContinueBook(chatId, text.replace('/continue_book', '').trim());
     return true;
   }
   if (text === '/fix_legacy_images' || text.startsWith('/fix_legacy_images ')) {
