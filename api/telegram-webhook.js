@@ -134,17 +134,71 @@ function formatComparisonAsText(table) {
     .join('\n\n');
 }
 
-function formatResults(results) {
-  return results
-    .map((r, i) => {
-      const pageNote = r.page ? ` _(صفحة ${r.page})_` : '';
-      const body =
-        r.isComparison && r.comparisonTable
-          ? `${r.answer ? r.answer + '\n\n' : ''}${formatComparisonAsText(r.comparisonTable)}`
-          : r.answer;
-      return `*${i + 1}.* ${r.question}\n${body}${pageNote}`;
-    })
-    .join('\n\n');
+function formatOneResult(r, i) {
+  const pageNote = r.page ? ` _(صفحة ${r.page})_` : '';
+  const body =
+    r.isComparison && r.comparisonTable
+      ? `${r.answer ? r.answer + '\n\n' : ''}${formatComparisonAsText(r.comparisonTable)}`
+      : r.answer;
+  return `*${i + 1}.* ${r.question}\n${body}${pageNote}`;
+}
+
+// Splits the FINAL results array (same order/indexing as the PDF/text
+// reply — see isUnanswered's block comment above) into consecutive
+// per-chapter groups, mirroring the exact "new banner only on an actual
+// chapter change" rule lib/pdfGenerator.js / lib/pdfDesign2.js use to
+// draw chapter banners in the PDF: a group only starts when r.chapter is
+// truthy AND differs from the chapter currently in effect. Untagged
+// questions (r.chapter is null/undefined), or ones repeating the same
+// chapter as the question before them, just fall into the current group
+// instead of starting a new one — so a chapter title is never repeated
+// message-to-message for consecutive questions from the same chapter,
+// and untagged questions never get a spurious "no chapter" title. Each
+// item keeps its ORIGINAL index (i) so the "Q<n>" numbering in the text
+// reply still matches the PDF/spoiler numbering regardless of grouping.
+function groupResultsByChapter(results) {
+  const groups = [];
+  let current = null;
+  let lastChapter = null;
+  results.forEach((r, i) => {
+    if (r.chapter && r.chapter !== lastChapter) {
+      current = { chapter: r.chapter, items: [] };
+      groups.push(current);
+      lastChapter = r.chapter;
+    } else if (!current) {
+      current = { chapter: null, items: [] };
+      groups.push(current);
+    }
+    current.items.push({ r, i });
+  });
+  return groups;
+}
+
+// Chapter title text sent as its OWN separate message right before the
+// set of questions belonging to it — Markdown flavor for the plain
+// (non-spoiler) text reply, HTML flavor (escaped) for spoiler mode,
+// which is always sent with parse_mode: 'HTML'.
+function formatChapterTitleMarkdown(chapter) {
+  return `📖 *${chapter}*`;
+}
+function formatChapterTitleHtml(chapter) {
+  return `📖 <b>${escapeHtml(chapter)}</b>`;
+}
+
+// Sends the plain (non-spoiler) text reply, one message per chapter
+// group: a separate "📖 <chapter title>" message first, then the
+// group's questions/answers combined into one sendLongMessage call (same
+// as before) — untagged groups (chapter === null) skip the title message
+// entirely and just send their questions as before.
+async function sendTextResults(chatId, results) {
+  const groups = groupResultsByChapter(results);
+  for (const group of groups) {
+    if (group.chapter) {
+      await telegram.sendMessage(chatId, formatChapterTitleMarkdown(group.chapter));
+    }
+    const text = group.items.map(({ r, i }) => formatOneResult(r, i)).join('\n\n');
+    await telegram.sendLongMessage(chatId, text);
+  }
 }
 
 // A question "wasn't answered" when Gemini couldn't match it to any real
@@ -231,8 +285,14 @@ function formatResultSpoiler(r, i) {
 // goes through sendLongMessage per-question in case any single answer is
 // long enough to need splitting on its own.
 async function sendSpoilerResults(chatId, results) {
-  for (let i = 0; i < results.length; i++) {
-    await telegram.sendLongMessage(chatId, formatResultSpoiler(results[i], i), { parse_mode: 'HTML' });
+  const groups = groupResultsByChapter(results);
+  for (const group of groups) {
+    if (group.chapter) {
+      await telegram.sendMessage(chatId, formatChapterTitleHtml(group.chapter), { parse_mode: 'HTML' });
+    }
+    for (const { r, i } of group.items) {
+      await telegram.sendLongMessage(chatId, formatResultSpoiler(r, i), { parse_mode: 'HTML' });
+    }
   }
 }
 
@@ -691,7 +751,7 @@ async function deliverResults(chatId, results, book, fromUser, format, designId,
     if (spoiler) {
       await sendSpoilerResults(chatId, results);
     } else {
-      await telegram.sendLongMessage(chatId, formatResults(results));
+      await sendTextResults(chatId, results);
     }
   }
 
@@ -710,7 +770,7 @@ async function deliverResults(chatId, results, book, fromUser, format, designId,
         if (spoiler) {
           await sendSpoilerResults(chatId, results);
         } else {
-          await telegram.sendLongMessage(chatId, formatResults(results));
+          await sendTextResults(chatId, results);
         }
       }
     } else {
@@ -774,7 +834,7 @@ async function deliverResults(chatId, results, book, fromUser, format, designId,
           if (spoiler) {
             await sendSpoilerResults(chatId, results);
           } else {
-            await telegram.sendLongMessage(chatId, formatResults(results));
+            await sendTextResults(chatId, results);
           }
         }
       }
