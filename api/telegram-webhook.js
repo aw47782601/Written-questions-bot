@@ -138,16 +138,11 @@ function formatResults(results) {
   return results
     .map((r, i) => {
       const pageNote = r.page ? ` _(صفحة ${r.page})_` : '';
-      // Chapter/section tag (from AI extraction — see
-      // lib/questionExtractor.js) shown right beside the question
-      // number, same as the PDF's chapter banners but inline here since
-      // plain-text delivery has no per-page banners of its own.
-      const chapterNote = r.chapter ? ` (${r.chapter})` : '';
       const body =
         r.isComparison && r.comparisonTable
           ? `${r.answer ? r.answer + '\n\n' : ''}${formatComparisonAsText(r.comparisonTable)}`
           : r.answer;
-      return `*${i + 1}.*${chapterNote} ${r.question}\n${body}${pageNote}`;
+      return `*${i + 1}.* ${r.question}\n${body}${pageNote}`;
     })
     .join('\n\n');
 }
@@ -177,17 +172,31 @@ function isUnanswered(r) {
 // index + 1 lines up with the "Q<n>" badge the user sees on each card),
 // returns the unanswered questions as { number, chapter } entries, e.g.
 // [{ number: 3, chapter: 'الباب الأول' }, { number: 7, chapter: null }] —
+// Given the FINAL results array (same order as the PDF/text reply, so
+// index + 1 lines up with the "Q<n>" badge the user sees on each card),
+// returns the unanswered questions as { number, question } entries, e.g.
+// [{ number: 3, question: 'What causes...' }, { number: 7, question: '...' }] —
 // used to build the "❌ أسئلة لم تتم الإجابة عليها" line in the delivery
-// caption instead of the PDF trailing them at the end. chapter (from AI
-// extraction — see lib/questionExtractor.js) is included alongside the
-// number so the user can tell at a glance which chapter/section each
-// unsolved question belongs to without opening the PDF.
+// caption instead of the PDF trailing them at the end. The question text
+// is included alongside the number (instead of e.g. the chapter) so the
+// user can tell exactly which question is unsolved without opening the
+// PDF or scrolling back to find "Q45" among a long list.
 function unansweredQuestionNumbers(results) {
   const entries = [];
   results.forEach((r, idx) => {
-    if (isUnanswered(r)) entries.push({ number: idx + 1, chapter: r.chapter || null });
+    if (isUnanswered(r)) entries.push({ number: idx + 1, question: r.question || '' });
   });
   return entries;
+}
+
+// Shortens a question's text to at most maxLen characters (trimming
+// trailing whitespace before appending an ellipsis) — used for the
+// unsolved-questions caption line above, so a handful of long questions
+// can't blow past Telegram's 1024-character caption limit.
+function truncateForCaption(text, maxLen) {
+  const t = (text || '').trim();
+  if (t.length <= maxLen) return t;
+  return `${t.slice(0, maxLen - 1).trimEnd()}…`;
 }
 
 // Converts already-escaped-safe raw text into HTML, turning Gemini's
@@ -208,15 +217,12 @@ function markupToHtml(text) {
 // Requires the message to be sent with parse_mode: 'HTML'.
 function formatResultSpoiler(r, i) {
   const pageNote = r.page ? ` <i>(صفحة ${r.page})</i>` : '';
-  // Same chapter tag beside the number as formatResults above, HTML-escaped
-  // since this path sends with parse_mode: 'HTML'.
-  const chapterNote = r.chapter ? ` (${escapeHtml(r.chapter)})` : '';
   const bodyRaw =
     r.isComparison && r.comparisonTable
       ? `${r.answer ? r.answer + '\n\n' : ''}${formatComparisonAsText(r.comparisonTable)}`
       : r.answer;
   const bodyHtml = markupToHtml(bodyRaw);
-  return `<b>${i + 1}.</b>${chapterNote} ${escapeHtml(r.question)}\n\n<tg-spoiler>${bodyHtml}</tg-spoiler>${pageNote}`;
+  return `<b>${i + 1}.</b> ${escapeHtml(r.question)}\n\n<tg-spoiler>${bodyHtml}</tg-spoiler>${pageNote}`;
 }
 
 // Sends each question as its OWN Telegram message in 🙈 نص مشوش mode
@@ -734,19 +740,19 @@ async function deliverResults(chatId, results, book, fromUser, format, designId,
         // Its own clearly-labeled "header" line/section (bold, on its own
         // paragraph) rather than a single run-on sentence, so it's
         // immediately obvious at a glance which questions still need
-        // attention — with the exact Q<n> numbers listed right under it,
-        // same numbering as the PDF/text reply (see
-        // isUnanswered/unansweredQuestionNumbers above), and each number
-        // tagged with its chapter/section (when known) so the user can
-        // tell which part of the book still needs attention without
-        // opening the PDF. escapeHtml on the chapter name since the
-        // caption now uses parse_mode: 'HTML' and chapter text comes from
-        // AI extraction (lib/questionExtractor.js), not a fixed string.
+        // attention — with each unsolved question shown as "<رقم>:
+        // <نص السؤال>" (same numbering as the PDF/text reply — see
+        // isUnanswered/unansweredQuestionNumbers above) on its own line,
+        // one per question, so the user can tell exactly which question
+        // needs attention without opening the PDF. Question text is
+        // capped to keep a long list of unsolved questions from blowing
+        // past Telegram's 1024-char caption limit, and escapeHtml'd since
+        // the caption uses parse_mode: 'HTML'.
         const unansweredLine =
           unansweredEntries.length > 0
             ? `\n\n❌ <b>أسئلة لم تتم الإجابة عليها (${unansweredEntries.length}):</b>\n${unansweredEntries
-                .map((e) => (e.chapter ? `Q${e.number} (${escapeHtml(e.chapter)})` : `Q${e.number}`))
-                .join('، ')}`
+                .map((e) => `${e.number}: ${escapeHtml(truncateForCaption(e.question, 80))}`)
+                .join('\n')}`
             : '';
         await telegram.sendDocument(chatId, pdfBuffer, pdfFilename, {
           // parse_mode: 'HTML' now that the caption uses a <b> header
