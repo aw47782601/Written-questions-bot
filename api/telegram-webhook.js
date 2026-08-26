@@ -138,11 +138,16 @@ function formatResults(results) {
   return results
     .map((r, i) => {
       const pageNote = r.page ? ` _(صفحة ${r.page})_` : '';
+      // Chapter/section tag (from AI extraction — see
+      // lib/questionExtractor.js) shown right beside the question
+      // number, same as the PDF's chapter banners but inline here since
+      // plain-text delivery has no per-page banners of its own.
+      const chapterNote = r.chapter ? ` (${r.chapter})` : '';
       const body =
         r.isComparison && r.comparisonTable
           ? `${r.answer ? r.answer + '\n\n' : ''}${formatComparisonAsText(r.comparisonTable)}`
           : r.answer;
-      return `*${i + 1}.* ${r.question}\n${body}${pageNote}`;
+      return `*${i + 1}.*${chapterNote} ${r.question}\n${body}${pageNote}`;
     })
     .join('\n\n');
 }
@@ -150,26 +155,39 @@ function formatResults(results) {
 // A question "wasn't answered" when Gemini couldn't match it to any real
 // book content (page === null — includes both the "مش واضحة" fallback
 // text and the isError retry-message case) — see lib/batchAnswer.js.
+// EXCEPTION: a question the user answered themselves via "answer <رقم>:
+// ..." (see parseEditLines/buildEditedResults + formatUserAnswers in
+// lib/answeredBatches.js) is always counted as answered, even though it
+// has no book page to cite (isUserAnswered is set instead of page). Even
+// if Gemini's FORMATTING step for that answer failed and fell back to the
+// student's raw unformatted text, the answer content itself is still
+// there — only its layout wasn't polished — so it must not show up as
+// "unsolved" either.
 // These stay in their ORIGINAL position in the results array (and so in
 // the PDF/text reply too) — Q1, Q2, ... is simply the order the
 // questions were asked in, unanswered ones included, instead of being
 // pushed to the end. See buildUnansweredNumbersLine below for how the
 // user is told WHICH numbers came back unanswered.
 function isUnanswered(r) {
+  if (r.isUserAnswered) return false;
   return r.isError || r.page === null;
 }
 
 // Given the FINAL results array (same order as the PDF/text reply, so
 // index + 1 lines up with the "Q<n>" badge the user sees on each card),
-// returns the 1-based question numbers that came back unanswered, e.g.
-// [3, 7, 9] — used to build the "❌ الأسئلة اللي من غير إجابة: ..." line
-// in the delivery caption instead of the PDF trailing them at the end.
+// returns the unanswered questions as { number, chapter } entries, e.g.
+// [{ number: 3, chapter: 'الباب الأول' }, { number: 7, chapter: null }] —
+// used to build the "❌ أسئلة لم تتم الإجابة عليها" line in the delivery
+// caption instead of the PDF trailing them at the end. chapter (from AI
+// extraction — see lib/questionExtractor.js) is included alongside the
+// number so the user can tell at a glance which chapter/section each
+// unsolved question belongs to without opening the PDF.
 function unansweredQuestionNumbers(results) {
-  const numbers = [];
+  const entries = [];
   results.forEach((r, idx) => {
-    if (isUnanswered(r)) numbers.push(idx + 1);
+    if (isUnanswered(r)) entries.push({ number: idx + 1, chapter: r.chapter || null });
   });
-  return numbers;
+  return entries;
 }
 
 // Converts already-escaped-safe raw text into HTML, turning Gemini's
@@ -190,12 +208,15 @@ function markupToHtml(text) {
 // Requires the message to be sent with parse_mode: 'HTML'.
 function formatResultSpoiler(r, i) {
   const pageNote = r.page ? ` <i>(صفحة ${r.page})</i>` : '';
+  // Same chapter tag beside the number as formatResults above, HTML-escaped
+  // since this path sends with parse_mode: 'HTML'.
+  const chapterNote = r.chapter ? ` (${escapeHtml(r.chapter)})` : '';
   const bodyRaw =
     r.isComparison && r.comparisonTable
       ? `${r.answer ? r.answer + '\n\n' : ''}${formatComparisonAsText(r.comparisonTable)}`
       : r.answer;
   const bodyHtml = markupToHtml(bodyRaw);
-  return `<b>${i + 1}.</b> ${escapeHtml(r.question)}\n\n<tg-spoiler>${bodyHtml}</tg-spoiler>${pageNote}`;
+  return `<b>${i + 1}.</b>${chapterNote} ${escapeHtml(r.question)}\n\n<tg-spoiler>${bodyHtml}</tg-spoiler>${pageNote}`;
 }
 
 // Sends each question as its OWN Telegram message in 🙈 نص مشوش mode
@@ -702,20 +723,38 @@ async function deliverResults(chatId, results, book, fromUser, format, designId,
         // a question counts as answered when it wasn't a transient error
         // AND Gemini matched it to real book content (page !== null).
         const totalCount = results.length;
-        const answeredCount = results.filter((r) => !r.isError && r.page !== null).length;
+        const answeredCount = results.filter((r) => !isUnanswered(r)).length;
         // Unanswered questions stay in their original position inside
         // the PDF (see isUnanswered/unansweredQuestionNumbers above)
         // instead of being moved to the end — so instead of the user
         // having to scan the whole PDF to find them, the caption calls
         // out exactly which Q<n> numbers came back unanswered right here,
         // at delivery time.
-        const unansweredNums = unansweredQuestionNumbers(results);
+        const unansweredEntries = unansweredQuestionNumbers(results);
+        // Its own clearly-labeled "header" line/section (bold, on its own
+        // paragraph) rather than a single run-on sentence, so it's
+        // immediately obvious at a glance which questions still need
+        // attention — with the exact Q<n> numbers listed right under it,
+        // same numbering as the PDF/text reply (see
+        // isUnanswered/unansweredQuestionNumbers above), and each number
+        // tagged with its chapter/section (when known) so the user can
+        // tell which part of the book still needs attention without
+        // opening the PDF. escapeHtml on the chapter name since the
+        // caption now uses parse_mode: 'HTML' and chapter text comes from
+        // AI extraction (lib/questionExtractor.js), not a fixed string.
         const unansweredLine =
-          unansweredNums.length > 0
-            ? `\n❌ الأسئلة اللي من غير إجابة: ${unansweredNums.map((n) => `Q${n}`).join('، ')}`
+          unansweredEntries.length > 0
+            ? `\n\n❌ <b>أسئلة لم تتم الإجابة عليها (${unansweredEntries.length}):</b>\n${unansweredEntries
+                .map((e) => (e.chapter ? `Q${e.number} (${escapeHtml(e.chapter)})` : `Q${e.number}`))
+                .join('، ')}`
             : '';
         await telegram.sendDocument(chatId, pdfBuffer, pdfFilename, {
-          caption: `📄 إجاباتك على ${results.length} سؤال من "${book.name}"\n✅ تم الإجابة على ${answeredCount} من ${totalCount} سؤال${unansweredLine}`,
+          // parse_mode: 'HTML' now that the caption uses a <b> header
+          // above, so book.name (free text, could contain <, &, etc.)
+          // must be escaped or a stray character could break the whole
+          // caption's formatting / make Telegram reject the request.
+          caption: `📄 إجاباتك على ${results.length} سؤال من "${escapeHtml(book.name)}"\n✅ تم الإجابة على ${answeredCount} من ${totalCount} سؤال${unansweredLine}`,
+          parse_mode: 'HTML',
         });
         pdfSent = true;
         generatedPdfBuffer = pdfBuffer;
@@ -786,7 +825,7 @@ function buildRetryRewordKeyboard(token, failedCount) {
 // per-batch format prompt for).
 async function offerRetryReword(chatId, fromUser, book, results, format, designId, colorKey, spoiler) {
   if (!fromUser) return;
-  const failedCount = results.filter((r) => r.isError || r.page === null).length;
+  const failedCount = results.filter((r) => isUnanswered(r)).length;
   const token = await answeredBatches.saveBatch(fromUser.id, {
     bookId: book.id,
     bookName: book.name,
@@ -819,6 +858,7 @@ function isEditCommandLine(rawLine) {
   return (
     /^add\s+\d+\s*[:\-]/i.test(line) ||
     /^delete\s+\d+\s*$/i.test(line) ||
+    /^delete\s+(all\s+)?unsolved\s*$/i.test(line) ||
     /^answer\s+\d+\s*[:\-]/i.test(line) ||
     /^\d+\s*[:\-]/.test(line)
   );
@@ -835,6 +875,16 @@ function isEditCommandLine(rawLine) {
 //                                  everything after it, down by one).
 //   "delete <number>"           → DELETE the question at that position
 //                                  entirely (no Gemini call needed).
+//   "delete unsolved"           → DELETE every question in the batch that
+//                                  currently has no answer (see
+//                                  isUnanswered above) — i.e. everything
+//                                  that would show up in the "❌ أسئلة لم
+//                                  تتم الإجابة عليها" list — in one shot,
+//                                  no Gemini call needed. If the SAME
+//                                  message also rewords or answers one of
+//                                  those unsolved questions, that one is
+//                                  fixed instead of deleted (see
+//                                  buildEditedResults below).
 //   "answer <number>: <text>"   → REPLACE the answer at that position with
 //                                  the user's OWN text (Gemini only
 //                                  FORMATS it — see formatUserAnswers in
@@ -858,6 +908,7 @@ function parseEditLines(text, resultsLength) {
   const deletes = new Set(); // 0-based idx
   const adds = []; // { atIndex (0-based, insert BEFORE this original position), question }
   const userAnswers = new Map(); // 0-based idx -> user-written answer text (verbatim content, to be formatted only)
+  let deleteUnsolved = false; // "delete unsolved" — expanded against isUnanswered() in buildEditedResults, since that needs the actual result objects (isError/page/isUserAnswered), not just their count.
 
   const lines = text.split('\n');
   let i = 0;
@@ -873,6 +924,11 @@ function parseEditLines(text, resultsLength) {
       // Valid target positions are 0..resultsLength (resultsLength itself
       // means "insert as the new last question").
       if (pos >= 0 && pos <= resultsLength && question) adds.push({ atIndex: pos, question });
+      continue;
+    }
+
+    if (/^delete\s+(all\s+)?unsolved\s*$/i.test(line)) {
+      deleteUnsolved = true;
       continue;
     }
 
@@ -907,7 +963,7 @@ function parseEditLines(text, resultsLength) {
     }
   }
 
-  return { rewords, deletes, adds, userAnswers };
+  return { rewords, deletes, adds, userAnswers, deleteUnsolved };
 }
 
 // Builds the ordered "plan" for the final results array from the parsed
@@ -931,6 +987,20 @@ function buildEditedResults(originalResults, edits) {
   });
 
   const n = originalResults.length;
+  // "delete unsolved" expands to every currently-unsolved question's
+  // index (same isUnanswered() check the rest of the bot uses), merged
+  // into the explicit per-number deletes — EXCEPT any index this same
+  // message is also rewording or user-answering, since fixing a question
+  // and deleting it in the same breath would be a contradictory, almost
+  // certainly unintended combination; the explicit fix wins.
+  const deletes = new Set(edits.deletes);
+  if (edits.deleteUnsolved) {
+    for (let i = 0; i < n; i++) {
+      if (edits.rewords.has(i) || edits.userAnswers.has(i)) continue;
+      if (isUnanswered(originalResults[i])) deletes.add(i);
+    }
+  }
+
   const plan = [];
   for (let i = 0; i <= n; i++) {
     if (addsByPos.has(i)) {
@@ -944,7 +1014,7 @@ function buildEditedResults(originalResults, edits) {
       });
     }
     if (i < n) {
-      if (edits.deletes.has(i)) continue;
+      if (deletes.has(i)) continue;
       if (edits.userAnswers.has(i)) {
         plan.push({
           kind: 'format',
@@ -975,7 +1045,7 @@ async function finalizeRetryOrReword(chatId, fromUser, book, results, format, de
   );
 
   const total = results.length;
-  const success = results.filter((r) => !r.isError && r.page !== null).length;
+  const success = results.filter((r) => !isUnanswered(r)).length;
   const userLabel = fromUser
     ? `${escapeHtml(fromUser.first_name || '')}${fromUser.username ? ' (@' + escapeHtml(fromUser.username) + ')' : ''} — <code>${fromUser.id}</code>`
     : `<code>${chatId}</code>`;
@@ -1115,10 +1185,13 @@ async function processBatchWithFormat(chatId, questions, book, fromUser, format,
     generatedPdfFilename = pdfName;
     // A question counts as "successfully answered" when Gemini matched
     // it to real book content (page !== null) and it wasn't a transient
-    // error. Questions the book genuinely doesn't cover come back with
-    // page: null and don't count toward the success rate.
+    // error, OR the user supplied their own answer via an "answer <رقم>:
+    // ..." edit (isUserAnswered — see isUnanswered above). Questions the
+    // book genuinely doesn't cover, and that the user hasn't answered
+    // themselves either, come back with page: null and don't count
+    // toward the success rate.
     const total = results.length;
-    const success = results.filter((r) => !r.isError && r.page !== null).length;
+    const success = results.filter((r) => !isUnanswered(r)).length;
 
     const formatLine = `📨 <b>صيغة الاستلام:</b> ${FORMAT_LABELS[format]}${spoiler ? ' 🙈 (نص مشوش)' : ''}${wantsPdf && !pdfSent ? ' (⚠️ فشل إرسال الـ PDF)' : ''}`;
     const reportLines = [
@@ -3226,8 +3299,14 @@ if (data.startsWith('ansclr_')) {
       return;
     }
 
+    // Same "unanswered" definition as everywhere else (see isUnanswered
+    // above) — in particular this must skip questions the user answered
+    // themselves via "answer <رقم>: ..." (isUserAnswered), since those
+    // have no book page to retry against and retrying them with the AI
+    // would just overwrite the student's own answer with a fresh
+    // RAG-derived one.
     const failedIndices = batch.results
-      .map((r, i) => (r.isError || r.page === null ? i : -1))
+      .map((r, i) => (isUnanswered(r) ? i : -1))
       .filter((i) => i !== -1);
     if (failedIndices.length === 0) {
       await telegram.answerCallbackQuery(cb.id, { text: '✅ كل الأسئلة اتجاوبت خلاص.', show_alert: true });
@@ -3303,12 +3382,14 @@ if (data.startsWith('ansclr_')) {
         '• *تعديل صياغة سؤال موجود:* اكتب رقم السؤال ونقطتين وبعدين الصياغة الجديدة.\n' +
         '• *إضافة سؤال جديد في مكان معيّن:* اكتب كلمة add ورقم المكان ونقطتين وبعدين نص السؤال — السؤال هيتحط في المكان ده بالظبط، وكل اللي بعده هيتزحلق رقم واحد.\n' +
         '• *حذف سؤال:* اكتب كلمة delete ورقم السؤال، من غير أي حاجة تانية.\n' +
+        '• *حذف كل الأسئلة اللي من غير إجابة دفعة واحدة:* اكتب delete unsolved، من غير أي رقم.\n' +
         '• *استبدال الإجابة بإجابتك انت:* اكتب كلمة answer ورقم السؤال ونقطتين وبعدين إجابتك بنفسك (ممكن تكتبها في أكتر من سطر) — الذكاء الاصطناعي مش هيغيّر أو يدقق في كلامك، هيظبطلك بس الشكل (تقسيم لنقاط، أو جدول مقارنة، وتظليل الكلمات المهمة).\n\n' +
         'مثال (Examples):\n' +
         '45: What is a clearer definition of photosynthesis?\n' +
         'add 43: How does osmosis differ from diffusion?\n' +
         'delete 12\n' +
-        'answer 49: الإجابة عندي إن الخلية النباتية بتختلف عن الحيوانية إنها فيها جدار خلوي وبلاستيدات خضراء وفجوة عصارية كبيرة'
+        'answer 49: الإجابة عندي إن الخلية النباتية بتختلف عن الحيوانية إنها فيها جدار خلوي وبلاستيدات خضراء وفجوة عصارية كبيرة\n\n' +
+        'أو ابعت delete unsolved لوحده لو عايز تشيل كل الأسئلة اللي معندهاش إجابة دفعة واحدة.'
     );
     return;
   }
@@ -3706,7 +3787,25 @@ module.exports = async (req, res) => {
         }
 
         const edits = parseEditLines(text, batch.results.length);
-        const editCount = edits.rewords.size + edits.deletes.size + edits.adds.length + edits.userAnswers.size;
+        // "delete unsolved" doesn't have its own count the way the other
+        // edit types do (rewords.size, deletes.size, ...) — it's a single
+        // flag that expands against the CURRENT batch.results, same
+        // isUnanswered()-based exclusion logic as buildEditedResults uses
+        // (skip anything this same message is also fixing via reword/
+        // answer). Computed here too so editCount recognizes "delete
+        // unsolved" as a valid instruction even when combined with other
+        // edits, and so the reply can say exactly how many got removed.
+        const unsolvedToDelete = edits.deleteUnsolved
+          ? batch.results
+              .map((r, i) => (isUnanswered(r) && !edits.rewords.has(i) && !edits.userAnswers.has(i) ? i : -1))
+              .filter((i) => i !== -1)
+          : [];
+        const editCount =
+          edits.rewords.size +
+          edits.deletes.size +
+          edits.adds.length +
+          edits.userAnswers.size +
+          (edits.deleteUnsolved ? 1 : 0);
 
         if (editCount === 0) {
           // Keep waiting — restore the pending state and ask again rather
@@ -3718,8 +3817,25 @@ module.exports = async (req, res) => {
               '<رقم>: <الصياغة الجديدة>\n' +
               'add <رقم>: <نص السؤال الجديد>\n' +
               'delete <رقم>\n' +
+              'delete unsolved\n' +
               'answer <رقم>: <إجابتك بنفسك>'
           );
+          res.status(200).json({ ok: true });
+          return;
+        }
+
+        // "delete unsolved" was the ONLY thing asked for, and there's
+        // nothing to delete — tell the user instead of silently
+        // redelivering an unchanged batch.
+        if (
+          edits.deleteUnsolved &&
+          unsolvedToDelete.length === 0 &&
+          edits.rewords.size === 0 &&
+          edits.deletes.size === 0 &&
+          edits.adds.length === 0 &&
+          edits.userAnswers.size === 0
+        ) {
+          await telegram.sendMessage(chatId, '✅ مفيش أي سؤال من غير إجابة دلوقت.');
           res.status(200).json({ ok: true });
           return;
         }
@@ -3735,6 +3851,7 @@ module.exports = async (req, res) => {
         if (edits.rewords.size > 0) summaryParts.push(`تعديل ${edits.rewords.size}`);
         if (edits.adds.length > 0) summaryParts.push(`إضافة ${edits.adds.length}`);
         if (edits.deletes.size > 0) summaryParts.push(`حذف ${edits.deletes.size}`);
+        if (unsolvedToDelete.length > 0) summaryParts.push(`حذف ${unsolvedToDelete.length} سؤال من غير إجابة`);
         if (edits.userAnswers.size > 0) summaryParts.push(`استبدال إجابة ${edits.userAnswers.size} بإجابتك`);
         await telegram.sendMessage(chatId, `✏️➕➖ جاري تنفيذ: ${summaryParts.join('، ')}...`);
 
@@ -3770,12 +3887,23 @@ module.exports = async (req, res) => {
             const f = formatted[fi++];
             // Keep the original question/page/chapter/image — only the
             // answer content (and its comparison-table shape) changes.
+            // isUserAnswered marks this as answered (see isUnanswered
+            // above) regardless of `page` (there's no book page to cite
+            // for the student's own answer, so page stays whatever it
+            // was — often null — and must NOT make this show up as
+            // "unsolved"). isError is deliberately NOT copied from f
+            // here: even when Gemini's formatting call itself failed,
+            // formatUserAnswers/formatBatch already falls back to the
+            // student's raw, unformatted text as `answer` — so a real
+            // answer is always present and this must still count as
+            // answered, just possibly with plainer formatting.
             return {
               ...p.original,
               answer: f.answer,
               isComparison: f.isComparison,
               comparisonTable: f.comparisonTable,
-              isError: f.isError,
+              isError: false,
+              isUserAnswered: true,
             };
           }
           return p.item;
