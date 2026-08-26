@@ -3339,7 +3339,11 @@ if (data.startsWith('ansclr_')) {
     const ownKeys = await userApiKeys.getUserApiKeysList(userId);
     if (ownKeys.length >= MIN_USER_KEYS_FOR_BOOST) extraKeys = ownKeys.map((k) => k.api_key);
 
-    const items = failedIndices.map((i) => ({ question: batch.results[i].question, chapter: batch.results[i].chapter }));
+    const items = failedIndices.map((i) => ({
+      question: batch.results[i].question,
+      chapter: batch.results[i].chapter,
+      forceTable: batch.results[i].forceTable,
+    }));
     const retried = await answerQuestions(items, book.id, extraKeys, usage);
 
     const merged = [...batch.results];
@@ -3873,10 +3877,17 @@ module.exports = async (req, res) => {
         if (ownKeys.length >= MIN_USER_KEYS_FOR_BOOST) extraKeys = ownKeys.map((k) => k.api_key);
 
         const plan = buildEditedResults(batch.results, edits);
+        // Note: 'answer' plan items (adds/rewords) don't pass forceTable
+        // here — a {table} tag typed inline in the new/reworded question
+        // text is detected and stripped by answerQuestions itself (see
+        // lib/batchAnswer.js). 'format' items DO need it passed explicitly:
+        // the original question's {table} tag was already stripped when
+        // that question was first created, so its forceTable flag only
+        // survives on p.original (see buildEditedResults above).
         const toAnswer = plan.filter((p) => p.kind === 'answer').map((p) => ({ question: p.question, chapter: p.chapter }));
         const toFormat = plan
           .filter((p) => p.kind === 'format')
-          .map((p) => ({ question: p.question, rawAnswer: p.rawAnswer }));
+          .map((p) => ({ question: p.question, rawAnswer: p.rawAnswer, forceTable: p.original?.forceTable }));
         // Both calls run in parallel — toAnswer (reword/add) needs a full
         // RAG + Gemini answer; toFormat ("answer <رقم>: ...") only needs
         // Gemini to format the user's own text, no RAG at all. A message
