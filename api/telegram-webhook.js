@@ -16,6 +16,7 @@ const pdfAccess = require('../lib/pdfAccess');
 const pdfColors = require('../lib/pdfColors');
 const { generateMcqPdf } = require('../lib/pdfDesignMcq');
 const jsonMcqMode = require('../lib/jsonMcqMode');
+const pendingJsonMcq = require('../lib/pendingJsonMcq');
 const { DailyLimitReachedError } = require('../lib/usageTracker');
 const botConfig = require('../lib/botConfig');
 const users = require('../lib/users');
@@ -423,8 +424,8 @@ async function handleJsonMcqCommand(chatId, userId) {
   await telegram.sendMessage(
     chatId,
     '📄 تمام، وضع "MCQ من JSON" اتفعّل.\n\n' +
-      'ابعتلي دلوقتي ملف JSON (زي اللي بيطلعه @Mcq_pdf_to_mcq_telegram_bot) وهطلعلك PDF بتصميم M.E.M فيه كل الأسئلة، مع تظليل الإجابة الصح.\n\n' +
-      'تقدر تبعت أكتر من ملف JSON وهيطلعلك PDF لكل ملف. اكتب /cancel_json_mcq لو عايز تقفل الوضع ده.'
+      'ابعتلي دلوقتي ملف JSON (زي اللي بيطلعه @Mcq_pdf_to_mcq_telegram_bot) وهسألك تحب تختار أي لون لملف الـ PDF (تصميم M.E.M فيه كل الأسئلة، مع تظليل الإجابة الصح).\n\n' +
+      'تقدر تبعت أكتر من ملف JSON وهيسألك عن اللون لكل ملف. اكتب /cancel_json_mcq لو عايز تقفل الوضع ده.'
   );
 }
 
@@ -433,15 +434,62 @@ async function handleCancelJsonMcqCommand(chatId, userId) {
   await telegram.sendMessage(chatId, '❌ تم إلغاء وضع "MCQ من JSON".');
 }
 
+// Shown after a .json file is parsed/validated (see handleJsonMcqUpload
+// below), so the user picks a main color for THIS PDF — same preset list
+// + "type your own hex" escape hatch as the written-question flow's
+// buildColorKeyboard, just with its own callback_data prefixes
+// (jsonmcqclr_ / jsonmcqclrcustom_) so the two flows' button taps can
+// never be confused with each other.
+function buildJsonMcqColorKeyboard(token) {
+  const buttons = pdfColors.listPdfColors().map((c) => [
+    { text: `${c.emoji} ${c.label}`, callback_data: `jsonmcqclr_${c.key}_${token}` },
+  ]);
+  buttons.push([{ text: '🎨 لون بالكود (اكتب الكود)', callback_data: `jsonmcqclrcustom_${token}` }]);
+  return { inline_keyboard: buttons };
+}
+
+// Shared tail of the /json_mcq color-selection step — used both when the
+// user taps a preset color button (jsonmcqclr_ in handleCallbackQuery
+// below) and when they finish typing a custom hex code
+// (jsonmcqclrcustom_ -> the plain-text handler further down). Consumes
+// the staged batch (lib/pendingJsonMcq.js) and actually renders the PDF.
+// respond.error(text): the batch is gone/stale — an alert popup for the
+//   button flow, a plain message for the typed-code flow.
+// respond.status(text): the "⏳ جاري توليد..." notice — acks + edits the
+//   existing message for the button flow, sends a new message for the
+//   typed-code flow.
+async function finishJsonMcqColorSelection(chatId, userId, token, colorKey, respond) {
+  const pending = await pendingJsonMcq.takeBatch(userId, token);
+  if (!pending) {
+    await respond.error('⚠️ الطلب ده قديم أو اتلغى. ابعتلي ملف الـ JSON تاني.');
+    return;
+  }
+
+  const { emoji, label } = pdfColors.describeColor(colorKey);
+  await respond.status(`⏳ جاري توليد الـ PDF (${emoji} ${label})...`);
+
+  try {
+    const pdfBuffer = await generateMcqPdf(pending.questions, { colorKey });
+    const baseName = (pending.fileName || 'mcq').replace(/\.json$/i, '').replace(/[^\w\-. \u0600-\u06FF]/g, '_');
+    const pdfFilename = `${baseName || 'mcq'}.pdf`;
+    let caption = `✅ ${pending.questions.length} سؤال اتحول لـ PDF (${emoji} ${label}).`;
+    if (pending.skipped > 0) caption += `\n⚠️ اتجاهل ${pending.skipped} سؤال ناقص بيانات (question/options/correctAnswerIndex).`;
+    await telegram.sendDocument(chatId, pdfBuffer, pdfFilename, { caption });
+  } catch (err) {
+    console.error('json_mcq: PDF generation failed:', err);
+    await telegram.sendMessage(chatId, `❌ فشل توليد الـ PDF:\n${err.message}`);
+  }
+}
+
 // Accepts a "questions_*.json" export (see lib/pdfDesignMcq.js's header
 // comment for the exact schema this expects) or a bare array of the same
 // question objects, validates/filters each entry defensively (a hand-
 // edited or partially-generated JSON file could easily have a missing
-// field), and renders whatever's left to a PDF via
-// lib/pdfDesignMcq.js's generateMcqPdf — the M.E.M design, header/footer
-// chrome copied verbatim from lib/pdfGenerator.js, per the user's
-// request to keep this as a standalone file rather than depending on
-// pdfGenerator.js.
+// field), then stages the survivors (lib/pendingJsonMcq.js) and asks the
+// user to pick a PDF color before rendering via lib/pdfDesignMcq.js's
+// generateMcqPdf — the M.E.M design, header/footer chrome copied verbatim
+// from lib/pdfGenerator.js, per the user's request to keep this as a
+// standalone file rather than depending on pdfGenerator.js.
 function extractMcqArrayFromJson(parsed) {
   if (Array.isArray(parsed)) return parsed;
   if (parsed && Array.isArray(parsed.questions)) return parsed.questions;
@@ -464,8 +512,8 @@ function isValidMcqEntry(q) {
   return true;
 }
 
-async function handleJsonMcqUpload(chatId, fileId, fileName) {
-  await telegram.sendMessage(chatId, '⏳ جاري قراءة ملف الـ JSON وتحويله لـ PDF...');
+async function handleJsonMcqUpload(chatId, userId, fileId, fileName) {
+  await telegram.sendMessage(chatId, '⏳ جاري قراءة ملف الـ JSON...');
 
   let parsed;
   try {
@@ -494,17 +542,10 @@ async function handleJsonMcqUpload(chatId, fileId, fileName) {
     return;
   }
 
-  try {
-    const pdfBuffer = await generateMcqPdf(questions);
-    const baseName = (fileName || 'mcq').replace(/\.json$/i, '').replace(/[^\w\-. \u0600-\u06FF]/g, '_');
-    const pdfFilename = `${baseName || 'mcq'}.pdf`;
-    let caption = `✅ ${questions.length} سؤال اتحول لـ PDF.`;
-    if (skipped > 0) caption += `\n⚠️ اتجاهل ${skipped} سؤال ناقص بيانات (question/options/correctAnswerIndex).`;
-    await telegram.sendDocument(chatId, pdfBuffer, pdfFilename, { caption });
-  } catch (err) {
-    console.error('json_mcq: PDF generation failed:', err);
-    await telegram.sendMessage(chatId, `❌ فشل توليد الـ PDF:\n${err.message}`);
-  }
+  const token = await pendingJsonMcq.stageBatch(userId, { questions, fileName, skipped });
+  await telegram.sendMessage(chatId, '🎨 اختار لون ملف الـ PDF:', {
+    reply_markup: buildJsonMcqColorKeyboard(token),
+  });
 }
 
 // /continue_book [id] — picks up a book's image-captioning pass exactly
@@ -3374,6 +3415,62 @@ if (data.startsWith('ansclr_')) {
     return;
   }
 
+  // 🎨 /json_mcq PDF color choice — data is "jsonmcqclr_<colorKey>_<token>".
+  // Same idea as ansclr_ above, but for the staged JSON-MCQ batch
+  // (lib/pendingJsonMcq.js) instead of a written-question batch — picking
+  // a color here goes straight to rendering, no design/format/spoiler
+  // steps in between (see finishJsonMcqColorSelection above).
+  if (data.startsWith('jsonmcqclr_')) {
+    const rest = data.slice('jsonmcqclr_'.length);
+    const sepIdx = rest.indexOf('_');
+    const colorKey = sepIdx === -1 ? rest : rest.slice(0, sepIdx);
+    const token = sepIdx === -1 ? '' : rest.slice(sepIdx + 1);
+
+    if (!pdfColors.isValidPdfColor(colorKey)) {
+      await telegram.answerCallbackQuery(cb.id);
+      return;
+    }
+
+    const { emoji, label } = pdfColors.describeColor(colorKey);
+    await finishJsonMcqColorSelection(chatId, userId, token, colorKey, {
+      error: (text) => telegram.answerCallbackQuery(cb.id, { text, show_alert: true }),
+      status: async (text) => {
+        await telegram.answerCallbackQuery(cb.id, { text: `✅ ${emoji} ${label}` });
+        await telegram.editMessageText(chatId, messageId, text);
+      },
+    });
+    return;
+  }
+
+  // 🎨 Custom /json_mcq PDF color by hex code — data is
+  // "jsonmcqclrcustom_<token>", the last button in
+  // buildJsonMcqColorKeyboard. Doesn't pick a color itself — just
+  // remembers which JSON-MCQ batch is waiting for a typed hex code next,
+  // so the very next text message from this user (see the
+  // pendingjsonmcqcolor_ check in the main message handler below) is
+  // read as the color code instead of routed as a new question/command.
+  if (data.startsWith('jsonmcqclrcustom_')) {
+    const token = data.slice('jsonmcqclrcustom_'.length);
+
+    const peeked = await pendingJsonMcq.peekBatch(userId, token);
+    if (!peeked) {
+      await telegram.answerCallbackQuery(cb.id, {
+        text: '⚠️ الطلب ده قديم أو اتلغى. ابعتلي ملف الـ JSON تاني.',
+        show_alert: true,
+      });
+      return;
+    }
+
+    await botConfig.setConfig(`pendingjsonmcqcolor_${userId}`, { token, createdAt: Date.now() });
+    await telegram.answerCallbackQuery(cb.id);
+    await telegram.editMessageText(
+      chatId,
+      messageId,
+      '🎨 ابعت كود اللون اللي عايزه (مثال: #ED6F60 أو ED6F60).'
+    );
+    return;
+  }
+
   // 🙈 Per-batch spoiler choice — data is "ansspl_<yes|no>_<token>". Final
   // step for 'text' and 'both' (see the ansfmt_/ansclr_ handlers above,
   // which route here instead of answering directly; pure 'pdf' skips this
@@ -3882,7 +3979,7 @@ module.exports = async (req, res) => {
         // JSON MCQ mode (see /json_mcq above) — render straight to a PDF
         // instead of routing through the written-question extraction
         // path below, which doesn't understand this file's shape.
-        await handleJsonMcqUpload(chatId, message.document.file_id, fileName);
+        await handleJsonMcqUpload(chatId, fromUser.id, message.document.file_id, fileName);
         await jsonMcqMode.touch(fromUser.id);
       } else if (admin && isPdf) {
         // Admin sending a PDF = add a new book (existing books untouched).
@@ -3929,6 +4026,33 @@ module.exports = async (req, res) => {
           await finishColorSelection(chatId, fromUser.id, fromUser, pendingColor.token, hex, {
             error: (t) => telegram.sendMessage(chatId, t),
             status: (t, extra) => telegram.sendMessage(chatId, t, extra),
+          });
+        }
+        res.status(200).json({ ok: true });
+        return;
+      }
+
+      // 🎨 Mid custom-/json_mcq-PDF-color entry (see the jsonmcqclrcustom_
+      // callback above) — same idea as the pendingcustomcolor_ block just
+      // above, but for a staged JSON-MCQ batch (lib/pendingJsonMcq.js)
+      // instead of a written-question one.
+      const pendingJsonMcqColor = await botConfig.getConfig(`pendingjsonmcqcolor_${fromUser.id}`);
+      if (pendingJsonMcqColor) {
+        const stale = Date.now() - (pendingJsonMcqColor.createdAt || 0) > 10 * 60 * 1000;
+        await botConfig.deleteConfig(`pendingjsonmcqcolor_${fromUser.id}`);
+        if (stale) {
+          await telegram.sendMessage(chatId, '⚠️ الوقت خلص. ابعتلي ملف الـ JSON تاني.');
+        } else if (!pdfColors.isHexColor(text)) {
+          await botConfig.setConfig(`pendingjsonmcqcolor_${fromUser.id}`, pendingJsonMcqColor);
+          await telegram.sendMessage(
+            chatId,
+            '⚠️ كود لون غير صحيح. ابعت كود بصيغة #RRGGBB زي #ED6F60.'
+          );
+        } else {
+          const hex = pdfColors.normalizeHex(text);
+          await finishJsonMcqColorSelection(chatId, fromUser.id, pendingJsonMcqColor.token, hex, {
+            error: (t) => telegram.sendMessage(chatId, t),
+            status: (t) => telegram.sendMessage(chatId, t),
           });
         }
         res.status(200).json({ ok: true });
