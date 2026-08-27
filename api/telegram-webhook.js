@@ -14,6 +14,8 @@ const collectSession = require('../lib/collectSession');
 const pdfDesigns = require('../lib/pdfDesigns');
 const pdfAccess = require('../lib/pdfAccess');
 const pdfColors = require('../lib/pdfColors');
+const { generateMcqPdf } = require('../lib/pdfDesignMcq');
+const jsonMcqMode = require('../lib/jsonMcqMode');
 const { DailyLimitReachedError } = require('../lib/usageTracker');
 const botConfig = require('../lib/botConfig');
 const users = require('../lib/users');
@@ -409,6 +411,99 @@ async function handleBookUpload(chatId, adminId, fileId, fileName, caption) {
   } catch (err) {
     console.error('Book ingestion failed:', err);
     await telegram.sendMessage(chatId, `❌ فشلت معالجة الكتاب "${bookName}":\n${err.message}`);
+  }
+}
+
+// /json_mcq — turns on "JSON MCQ mode" (see lib/jsonMcqMode.js) for this
+// user: every .json file they send afterwards is rendered straight to a
+// PDF via lib/pdfDesignMcq.js instead of going through the normal
+// PDF/TXT written-question extraction path below.
+async function handleJsonMcqCommand(chatId, userId) {
+  await jsonMcqMode.startMode(userId);
+  await telegram.sendMessage(
+    chatId,
+    '📄 تمام، وضع "MCQ من JSON" اتفعّل.\n\n' +
+      'ابعتلي دلوقتي ملف JSON (زي اللي بيطلعه @Mcq_pdf_to_mcq_telegram_bot) وهطلعلك PDF بتصميم M.E.M فيه كل الأسئلة، مع تظليل الإجابة الصح.\n\n' +
+      'تقدر تبعت أكتر من ملف JSON وهيطلعلك PDF لكل ملف. اكتب /cancel_json_mcq لو عايز تقفل الوضع ده.'
+  );
+}
+
+async function handleCancelJsonMcqCommand(chatId, userId) {
+  await jsonMcqMode.endMode(userId);
+  await telegram.sendMessage(chatId, '❌ تم إلغاء وضع "MCQ من JSON".');
+}
+
+// Accepts a "questions_*.json" export (see lib/pdfDesignMcq.js's header
+// comment for the exact schema this expects) or a bare array of the same
+// question objects, validates/filters each entry defensively (a hand-
+// edited or partially-generated JSON file could easily have a missing
+// field), and renders whatever's left to a PDF via
+// lib/pdfDesignMcq.js's generateMcqPdf — the M.E.M design, header/footer
+// chrome copied verbatim from lib/pdfGenerator.js, per the user's
+// request to keep this as a standalone file rather than depending on
+// pdfGenerator.js.
+function extractMcqArrayFromJson(parsed) {
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && Array.isArray(parsed.questions)) return parsed.questions;
+  return null;
+}
+
+function isValidMcqEntry(q) {
+  if (!q || typeof q !== 'object') return false;
+  if (typeof q.question !== 'string' || !q.question.trim()) return false;
+  if (!Array.isArray(q.options) || q.options.length < 2) return false;
+  if (!q.options.every((o) => typeof o === 'string' && o.trim())) return false;
+  if (
+    typeof q.correctAnswerIndex !== 'number' ||
+    !Number.isInteger(q.correctAnswerIndex) ||
+    q.correctAnswerIndex < 0 ||
+    q.correctAnswerIndex >= q.options.length
+  ) {
+    return false;
+  }
+  return true;
+}
+
+async function handleJsonMcqUpload(chatId, fileId, fileName) {
+  await telegram.sendMessage(chatId, '⏳ جاري قراءة ملف الـ JSON وتحويله لـ PDF...');
+
+  let parsed;
+  try {
+    const buffer = await telegram.downloadFileBuffer(fileId);
+    parsed = JSON.parse(buffer.toString('utf8'));
+  } catch (err) {
+    console.error('json_mcq: failed to read/parse JSON file:', err);
+    await telegram.sendMessage(chatId, '❌ الملف ده مش JSON صحيح، تأكد إنه نفس شكل الملفات اللي بيطلعها @Mcq_pdf_to_mcq_telegram_bot.');
+    return;
+  }
+
+  const rawList = extractMcqArrayFromJson(parsed);
+  if (!rawList) {
+    await telegram.sendMessage(
+      chatId,
+      '❌ ملقتش مصفوفة أسئلة في الملف ده. المفروض يكون فيه حقل "questions" (array)، أو الملف نفسه يكون array من الأسئلة.'
+    );
+    return;
+  }
+
+  const questions = rawList.filter(isValidMcqEntry);
+  const skipped = rawList.length - questions.length;
+
+  if (questions.length === 0) {
+    await telegram.sendMessage(chatId, '❌ مفيش ولا سؤال صحيح في الملف ده (لازم question + options (2 على الأقل) + correctAnswerIndex).');
+    return;
+  }
+
+  try {
+    const pdfBuffer = await generateMcqPdf(questions);
+    const baseName = (fileName || 'mcq').replace(/\.json$/i, '').replace(/[^\w\-. \u0600-\u06FF]/g, '_');
+    const pdfFilename = `${baseName || 'mcq'}.pdf`;
+    let caption = `✅ ${questions.length} سؤال اتحول لـ PDF.`;
+    if (skipped > 0) caption += `\n⚠️ اتجاهل ${skipped} سؤال ناقص بيانات (question/options/correctAnswerIndex).`;
+    await telegram.sendDocument(chatId, pdfBuffer, pdfFilename, { caption });
+  } catch (err) {
+    console.error('json_mcq: PDF generation failed:', err);
+    await telegram.sendMessage(chatId, `❌ فشل توليد الـ PDF:\n${err.message}`);
   }
 }
 
@@ -3781,8 +3876,15 @@ module.exports = async (req, res) => {
       const fileName = message.document.file_name || '';
       const isPdf = fileName.toLowerCase().endsWith('.pdf');
       const isText = fileName.toLowerCase().endsWith('.txt');
+      const isJson = fileName.toLowerCase().endsWith('.json');
 
-      if (admin && isPdf) {
+      if (isJson && (await jsonMcqMode.isActive(fromUser.id))) {
+        // JSON MCQ mode (see /json_mcq above) — render straight to a PDF
+        // instead of routing through the written-question extraction
+        // path below, which doesn't understand this file's shape.
+        await handleJsonMcqUpload(chatId, message.document.file_id, fileName);
+        await jsonMcqMode.touch(fromUser.id);
+      } else if (admin && isPdf) {
         // Admin sending a PDF = add a new book (existing books untouched).
         await handleBookUpload(chatId, chatId, message.document.file_id, fileName, message.caption);
       } else if (isPdf || isText) {
@@ -3794,6 +3896,8 @@ module.exports = async (req, res) => {
           ? await extractQuestionsFromPdfBuffer(buffer, extractionFailures, extractionGenerationCalls)
           : await extractQuestionsFromPlainTextBuffer(buffer, extractionFailures, extractionGenerationCalls);
         await handleQuestionsBatch(chatId, questions, fromUser, extractionFailures, extractionGenerationCalls);
+      } else if (isJson) {
+        await telegram.sendMessage(chatId, '⚠️ عشان أقدر أحول ملف JSON لـ PDF، ابعت /json_mcq الأول.');
       } else {
         await telegram.sendMessage(chatId, '⚠️ الصيغة دي مش مدعومة، ابعت PDF أو TXT.');
       }
@@ -4030,6 +4134,10 @@ module.exports = async (req, res) => {
         await handleRemoveKeyPrompt(chatId, fromUser.id);
       } else if (text.startsWith('/text')) {
         await handleStartCollectCommand(chatId, fromUser.id);
+      } else if (text.startsWith('/json_mcq')) {
+        await handleJsonMcqCommand(chatId, fromUser.id);
+      } else if (text.startsWith('/cancel_json_mcq')) {
+        await handleCancelJsonMcqCommand(chatId, fromUser.id);
       } else if (text.startsWith('/')) {
         await telegram.sendMessage(chatId, 'ابعت /text الأول، وبعدين ابعتلي سؤال أو أكتر (سؤال في كل سطر) وهدور عليهم في الكتاب.');
       } else {
