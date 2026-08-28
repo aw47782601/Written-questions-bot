@@ -424,8 +424,7 @@ async function handleJsonMcqCommand(chatId, userId) {
   await telegram.sendMessage(
     chatId,
     '📄 تمام، وضع "MCQ من JSON" اتفعّل.\n\n' +
-      'ابعتلي دلوقتي ملف JSON (زي اللي بيطلعه @Mcq_pdf_to_mcq_telegram_bot) وهسألك تحب تختار أي لون لملف الـ PDF (تصميم M.E.M فيه كل الأسئلة، مع تظليل الإجابة الصح).\n\n' +
-      'تقدر تبعت أكتر من ملف JSON وهيسألك عن اللون لكل ملف. اكتب /cancel_json_mcq لو عايز تقفل الوضع ده.'
+      'ابعتلي دلوقتي ملف JSON وهسألك تحب تختار أي لون لملف الـ PDF (تصميم M.E.M فيه كل الأسئلة، مع تظليل الإجابة الصح).'
   );
 }
 
@@ -4005,9 +4004,11 @@ module.exports = async (req, res) => {
       if (isJson && (await jsonMcqMode.isActive(fromUser.id))) {
         // JSON MCQ mode (see /json_mcq above) — render straight to a PDF
         // instead of routing through the written-question extraction
-        // path below, which doesn't understand this file's shape.
+        // path below, which doesn't understand this file's shape. One
+        // file per /json_mcq invocation: end the mode right after so a
+        // follow-up .json file needs a fresh /json_mcq to be accepted.
         await handleJsonMcqUpload(chatId, fromUser.id, message.document.file_id, fileName);
-        await jsonMcqMode.touch(fromUser.id);
+        await jsonMcqMode.endMode(fromUser.id);
       } else if (admin && isPdf) {
         // Admin sending a PDF = add a new book (existing books untouched).
         await handleBookUpload(chatId, chatId, message.document.file_id, fileName, message.caption);
@@ -4021,7 +4022,8 @@ module.exports = async (req, res) => {
           : await extractQuestionsFromPlainTextBuffer(buffer, extractionFailures, extractionGenerationCalls);
         await handleQuestionsBatch(chatId, questions, fromUser, extractionFailures, extractionGenerationCalls);
       } else if (isJson) {
-        await telegram.sendMessage(chatId, '⚠️ عشان أقدر أحول ملف JSON لـ PDF، ابعت /json_mcq الأول.');
+        // .json without an active /json_mcq mode — ignored silently, no
+        // reply, instead of nudging the user to run the command.
       } else {
         await telegram.sendMessage(chatId, '⚠️ الصيغة دي مش مدعومة، ابعت PDF أو TXT.');
       }
