@@ -424,7 +424,7 @@ async function handleJsonMcqCommand(chatId, userId) {
   await telegram.sendMessage(
     chatId,
     '📄 تمام، وضع "MCQ من JSON" اتفعّل.\n\n' +
-      'ابعتلي دلوقتي ملف JSON وهسألك تحب تختار أي لون لملف الـ PDF (تصميم M.E.M فيه كل الأسئلة، مع تظليل الإجابة الصح).'
+      'ابعتلي دلوقتي ملف JSON وهسألك تحب تختار أي لون لملف الـ PDF.'
   );
 }
 
