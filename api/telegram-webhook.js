@@ -458,7 +458,10 @@ function buildJsonMcqColorKeyboard(token) {
 // respond.status(text): the "⏳ جاري توليد..." notice — acks + edits the
 //   existing message for the button flow, sends a new message for the
 //   typed-code flow.
-async function finishJsonMcqColorSelection(chatId, userId, token, colorKey, respond) {
+// fromUser: the Telegram user object (id/first_name/username) for the
+//   admin-report user label — same shape processBatchWithFormat's
+//   userLabel uses. Falls back to chatId if unavailable.
+async function finishJsonMcqColorSelection(chatId, userId, token, colorKey, respond, fromUser = null) {
   const pending = await pendingJsonMcq.takeBatch(userId, token);
   if (!pending) {
     await respond.error('⚠️ الطلب ده قديم أو اتلغى. ابعتلي ملف الـ JSON تاني.');
@@ -475,6 +478,23 @@ async function finishJsonMcqColorSelection(chatId, userId, token, colorKey, resp
     let caption = `✅ ${pending.questions.length} سؤال اتحول لـ PDF (${emoji} ${label}).`;
     if (pending.skipped > 0) caption += `\n⚠️ اتجاهل ${pending.skipped} سؤال ناقص بيانات (question/options/correctAnswerIndex).`;
     await telegram.sendDocument(chatId, pdfBuffer, pdfFilename, { caption });
+
+    // 👑 Admin notification — same "one message, PDF as its own caption"
+    // pattern as notifyAdminsWithDocument's other callers (see
+    // processBatchWithFormat/finalizeRetryOrReword above): admins get
+    // the generated PDF itself, captioned with a short report, instead
+    // of the file plus a separate text message.
+    const userLabel = fromUser
+      ? `${escapeHtml(fromUser.first_name || '')}${fromUser.username ? ' (@' + escapeHtml(fromUser.username) + ')' : ''} — <code>${fromUser.id}</code>`
+      : `<code>${chatId}</code>`;
+    const reportLines = [
+      '📄 <b>MCQ من JSON</b>',
+      `👤 ${userLabel}`,
+      `📝 <b>${pending.questions.length}</b> سؤال اتحول لـ PDF (${emoji} ${label}).`,
+    ];
+    if (pending.fileName) reportLines.push(`📁 الملف الأصلي: <code>${escapeHtml(pending.fileName)}</code>`);
+    if (pending.skipped > 0) reportLines.push(`⚠️ اتجاهل ${pending.skipped} سؤال ناقص بيانات.`);
+    await notifyAdminsWithDocument(pdfBuffer, pdfFilename, reportLines, { parse_mode: 'HTML' });
   } catch (err) {
     console.error('json_mcq: PDF generation failed:', err);
     await telegram.sendMessage(chatId, `❌ فشل توليد الـ PDF:\n${err.message}`);
@@ -3432,13 +3452,20 @@ if (data.startsWith('ansclr_')) {
     }
 
     const { emoji, label } = pdfColors.describeColor(colorKey);
-    await finishJsonMcqColorSelection(chatId, userId, token, colorKey, {
-      error: (text) => telegram.answerCallbackQuery(cb.id, { text, show_alert: true }),
-      status: async (text) => {
-        await telegram.answerCallbackQuery(cb.id, { text: `✅ ${emoji} ${label}` });
-        await telegram.editMessageText(chatId, messageId, text);
+    await finishJsonMcqColorSelection(
+      chatId,
+      userId,
+      token,
+      colorKey,
+      {
+        error: (text) => telegram.answerCallbackQuery(cb.id, { text, show_alert: true }),
+        status: async (text) => {
+          await telegram.answerCallbackQuery(cb.id, { text: `✅ ${emoji} ${label}` });
+          await telegram.editMessageText(chatId, messageId, text);
+        },
       },
-    });
+      cb.from
+    );
     return;
   }
 
@@ -4050,10 +4077,17 @@ module.exports = async (req, res) => {
           );
         } else {
           const hex = pdfColors.normalizeHex(text);
-          await finishJsonMcqColorSelection(chatId, fromUser.id, pendingJsonMcqColor.token, hex, {
-            error: (t) => telegram.sendMessage(chatId, t),
-            status: (t) => telegram.sendMessage(chatId, t),
-          });
+          await finishJsonMcqColorSelection(
+            chatId,
+            fromUser.id,
+            pendingJsonMcqColor.token,
+            hex,
+            {
+              error: (t) => telegram.sendMessage(chatId, t),
+              status: (t) => telegram.sendMessage(chatId, t),
+            },
+            fromUser
+          );
         }
         res.status(200).json({ ok: true });
         return;
