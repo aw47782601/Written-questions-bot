@@ -256,6 +256,36 @@ function truncateForCaption(text, maxLen) {
   return `${t.slice(0, maxLen - 1).trimEnd()}…`;
 }
 
+// Reserve enough room in the caption budget for the "(+N دلوقتي في
+// الرسالة اللي بعد كده)" notice below, even in the (unrealistic) case of
+// a 4-digit overflow count, so appending that notice after the entries
+// are chosen never itself pushes the caption over the limit.
+const OVERFLOW_NOTICE_RESERVE = 60;
+
+// Per-question truncateForCaption (80 chars each) keeps any ONE unsolved
+// question from blowing the caption limit, but with enough unsolved
+// questions the LIST ITSELF can still add up past Telegram's 1024-char
+// cap — which used to make sendDocument reject the whole caption and the
+// PDF never arrived. Instead of that, this only includes as many
+// "<رقم>: <سؤال>" lines as fit inside the given budget (stopping on a
+// whole line, never mid-line) and hands back whatever didn't fit so the
+// caller can send it as an ordinary follow-up text message right after
+// the PDF, instead of losing it.
+function splitUnansweredEntriesForCaption(entries, fixedPrefixLength, limit) {
+  const budget = limit - fixedPrefixLength - OVERFLOW_NOTICE_RESERVE;
+  const lines = [];
+  let used = 0;
+  let i = 0;
+  for (; i < entries.length; i++) {
+    const line = `${entries[i].number}: ${escapeHtml(truncateForCaption(entries[i].question, 80))}`;
+    const addedLen = line.length + (lines.length > 0 ? 1 : 0); // +1 for the joining "\n"
+    if (used + addedLen > budget) break;
+    lines.push(line);
+    used += addedLen;
+  }
+  return { includedText: lines.join('\n'), overflowEntries: entries.slice(i) };
+}
+
 // Converts already-escaped-safe raw text into HTML, turning Gemini's
 // single-asterisk *bold* markup (see lib/batchAnswer.js) into real <b>
 // tags. Must run AFTER escapeHtml (asterisks aren't touched by it) so a
@@ -960,26 +990,49 @@ async function deliverResults(chatId, results, book, fromUser, format, designId,
         // isUnanswered/unansweredQuestionNumbers above) on its own line,
         // one per question, so the user can tell exactly which question
         // needs attention without opening the PDF. Question text is
-        // capped to keep a long list of unsolved questions from blowing
-        // past Telegram's 1024-char caption limit, and escapeHtml'd since
-        // the caption uses parse_mode: 'HTML'.
-        const unansweredLine =
-          unansweredEntries.length > 0
-            ? `\n\n❌ <b>أسئلة لم تتم الإجابة عليها (${unansweredEntries.length}):</b>\n${unansweredEntries
-                .map((e) => `${e.number}: ${escapeHtml(truncateForCaption(e.question, 80))}`)
-                .join('\n')}`
-            : '';
+        // capped per-entry (truncateForCaption) AND the list as a whole is
+        // capped (splitUnansweredEntriesForCaption) to fit Telegram's
+        // 1024-char caption limit — with a lot of unsolved questions the
+        // rest is sent as a follow-up text message below instead of
+        // making sendDocument reject the whole caption.
+        const captionPrefix = `📄 إجاباتك على ${results.length} سؤال من "${escapeHtml(book.name)}"\n✅ تم الإجابة على ${answeredCount} من ${totalCount} سؤال`;
+        let unansweredLine = '';
+        let unansweredOverflow = [];
+        if (unansweredEntries.length > 0) {
+          const header = `\n\n❌ <b>أسئلة لم تتم الإجابة عليها (${unansweredEntries.length}):</b>\n`;
+          const { includedText, overflowEntries } = splitUnansweredEntriesForCaption(
+            unansweredEntries,
+            captionPrefix.length + header.length,
+            TELEGRAM_CAPTION_LIMIT
+          );
+          unansweredOverflow = overflowEntries;
+          unansweredLine = includedText ? `${header}${includedText}` : '';
+          if (unansweredOverflow.length > 0) {
+            unansweredLine += `\n<i>(+${unansweredOverflow.length} في الرسالة اللي بعد كده)</i>`;
+          }
+        }
         await telegram.sendDocument(chatId, pdfBuffer, pdfFilename, {
           // parse_mode: 'HTML' now that the caption uses a <b> header
           // above, so book.name (free text, could contain <, &, etc.)
           // must be escaped or a stray character could break the whole
           // caption's formatting / make Telegram reject the request.
-          caption: `📄 إجاباتك على ${results.length} سؤال من "${escapeHtml(book.name)}"\n✅ تم الإجابة على ${answeredCount} من ${totalCount} سؤال${unansweredLine}`,
+          caption: `${captionPrefix}${unansweredLine}`,
           parse_mode: 'HTML',
         });
         pdfSent = true;
         generatedPdfBuffer = pdfBuffer;
         generatedPdfFilename = pdfFilename;
+
+        // Whatever unsolved-question lines didn't fit in the caption
+        // above — deliver them right after the PDF as a normal (auto-
+        // splitting, see sendLongMessage) text message instead of losing
+        // them.
+        if (unansweredOverflow.length > 0) {
+          const overflowText = `❌ <b>باقي الأسئلة اللي لسه من غير إجابة (${unansweredOverflow.length}):</b>\n\n${unansweredOverflow
+            .map((e) => `${e.number}: ${escapeHtml(e.question || '')}`)
+            .join('\n\n')}`;
+          await telegram.sendLongMessage(chatId, overflowText, { parse_mode: 'HTML' });
+        }
       } catch (pdfErr) {
         console.error('PDF generation/send failed:', pdfErr);
         await telegram.sendMessage(chatId, '⚠️ حصل خطأ أثناء تجهيز ملف الـ PDF، بس الإجابات وصلتك كنص لو كان مطلوب.');
