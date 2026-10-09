@@ -2112,7 +2112,8 @@ async function handleAdminHelp(chatId) {
     `🚫 <b>حظر المستخدمين:</b>\n` +
     `• <code>/ban USER_ID</code>, <code>/unban USER_ID</code>, <code>/banlist</code>\n\n` +
     `🎨 <b>صلاحيات تصاميم الـ PDF:</b>\n` +
-    `• <code>/pdfaccess</code> — يفتح لوحة أزرار: قايمة كل تصاميم الـ PDF المسجّلة، ادوس على أي تصميم عشان تشوف/تغيّر وضعه (متاح للكل ⇄ مقيّد على مجموعة)، ولو مقيّد تقدر تضيف/تشيل مستخدمين من مجموعته بالأزرار (بتكتب الـ USER_ID لما يتطلب منك ده بس).\n` +
+    `• <code>/pdfaccess</code> — يفتح لوحة أزرار: قايمة كل تصاميم الـ PDF المسجّلة، ادوس على أي تصميم عشان تشوف/تغيّر وضعه (متاح للكل ⇄ مقيّد على مجموعة)، وتضيف/تشيل مستخدمين من مجموعته — تقدر تبعت عدة IDs مرة واحدة (سطر لكل ID أو بمسافة/فاصلة).\n` +
+    `• <b>📦 مجموعات الـ IDs:</b> احفظ مجموعة IDs باسم (مثلاً دفعة A)، وبعدين ادوس "🚀 تفعيل على تصاميم" وعلّم أي عدد من التصاميم مرة واحدة. أو استخدم "⚡ تفعيل سريع" للصق IDs من غير حفظ.\n` +
     `• الوضع الافتراضي لأي تصميم جديد هو \"متاح للكل\".\n\n` +
     `⏳ <b>فترات إغلاق مجدولة (زي الامتحانات):</b>\n` +
     `• <code>/addblock</code> — يفتح لك تقويم وأزرار لاختيار تاريخ ووقت البداية والنهاية (12 ساعة + صباحاً/مساءً)، من غير ما تكتب حاجة يدوي. يقفل البوت لكل حد غير الأدمن في الفترة دي (بتوقيت القاهرة).\n` +
@@ -2321,8 +2322,10 @@ async function handleBanList(chatId) {
 async function buildPdfAccessOverview() {
   const designs = pdfDesigns.listDesigns();
   const buttons = designs.map((d) => [{ text: `🎨 ${d.label}`, callback_data: `pda_design_${d.id}` }]);
+  buttons.push([{ text: '📦 مجموعات الـ IDs', callback_data: 'pda_sets' }]);
+  buttons.push([{ text: '⚡ تفعيل سريع (لصق IDs + اختيار تصاميم)', callback_data: 'pda_quick' }]);
   return {
-    text: `🎨 <b>صلاحيات تصاميم الـ PDF</b>\n\nاختار تصميم عشان تشوف/تغيّر وضعه:`,
+    text: `🎨 <b>صلاحيات تصاميم الـ PDF</b>\n\nاختار تصميم عشان تشوف/تغيّر وضعه، أو استخدم المجموعات / التفعيل السريع لأكتر من تصميم مرة واحدة:`,
     reply_markup: { inline_keyboard: buttons },
   };
 }
@@ -2385,8 +2388,17 @@ async function handlePdfManageList(chatId, messageId, designId) {
     return;
   }
   const ids = await pdfAccess.getWhitelist(designId);
-  const listLine = ids.length > 0 ? '' : '\n\n📭 المجموعة فاضية حالياً.';
-  const removeButtons = ids.map((id) => [{ text: `❌ ${id}`, callback_data: `pda_removeuser_${designId}_${id}` }]);
+  // Few ids → one ❌ button each. Many ids → list them as text instead
+  // (Telegram caps keyboards at 100 buttons) and use the bulk-remove button.
+  const MAX_REMOVE_BUTTONS = 20;
+  const listLine =
+    ids.length === 0
+      ? '\n\n📭 المجموعة فاضية حالياً.'
+      : ids.length > MAX_REMOVE_BUTTONS
+        ? `\n\n${formatIdList(ids)}\n\nللحذف استخدم "➖ حذف عدة".`
+        : '';
+  const removeButtons =
+    ids.length > MAX_REMOVE_BUTTONS ? [] : ids.map((id) => [{ text: `❌ ${id}`, callback_data: `pda_removeuser_${designId}_${id}` }]);
   await telegram.editMessageText(
     chatId,
     messageId,
@@ -2396,7 +2408,10 @@ async function handlePdfManageList(chatId, messageId, designId) {
       reply_markup: {
         inline_keyboard: [
           ...removeButtons,
-          [{ text: '➕ إضافة مستخدم', callback_data: `pda_adduser_${designId}` }],
+          [
+            { text: '➕ إضافة مستخدم/أكتر', callback_data: `pda_adduser_${designId}` },
+            ...(ids.length > 0 ? [{ text: '➖ حذف عدة', callback_data: `pda_rmmany_${designId}` }] : []),
+          ],
           [{ text: '🔙 رجوع', callback_data: `pda_design_${designId}` }],
         ],
       },
@@ -2421,7 +2436,7 @@ async function handlePdfAddUserPrompt(chatId, messageId, adminId, designId) {
   await telegram.editMessageText(
     chatId,
     messageId,
-    `➕ ابعت الآن USER_ID المستخدم اللي عايز تضيفه لمجموعة "${design.label}" كرسالة نصية.`,
+    `➕ ابعت الآن USER_ID (واحد أو أكتر) اللي عايز تضيفهم لمجموعة "${design.label}" كرسالة نصية.\n\n${PDF_IDS_HINT}`,
     { reply_markup: { inline_keyboard: [[{ text: '❌ إلغاء', callback_data: `pda_managelist_${designId}` }]] } }
   );
 }
@@ -2430,24 +2445,393 @@ async function handlePdfAddUserPrompt(chatId, messageId, adminId, designId) {
 // "waiting to type a USER_ID to add" mode (set by handlePdfAddUserPrompt).
 // Returns true if it handled the message.
 async function tryHandlePdfAddUserPaste(chatId, adminId, text) {
+  // New flows (bulk remove, ID sets, quick activation) share one state key.
+  if (await tryHandlePdfInput(chatId, adminId, text)) return true;
+
   const state = await botConfig.getConfig(`pdfadduser_${adminId}`);
   if (!state || !state.designId) return false;
 
   await botConfig.deleteConfig(`pdfadduser_${adminId}`);
-  const targetId = text.trim();
   const design = pdfDesigns.DESIGNS[state.designId];
   if (!design) {
     await telegram.sendMessage(chatId, '❌ التصميم ده مبقاش موجود.');
     return true;
   }
-  if (!/^\d+$/.test(targetId)) {
-    await telegram.sendMessage(chatId, '⚠️ ده مش USER_ID صحيح (لازم يكون رقم). اتلغت العملية، استخدم /pdfaccess تاني لو عايز تحاول.');
+  const parsed = pdfAccess.parseIds(text);
+  if (parsed.valid.length === 0) {
+    // Keep waiting so the admin can just resend.
+    await botConfig.setConfig(`pdfadduser_${adminId}`, state);
+    await telegram.sendMessage(
+      chatId,
+      `⚠️ ما لقيتش أي USER_ID صحيح (لازم أرقام بس).${formatInvalidTokens(parsed.invalid, 0)}\n\nابعت تاني أو إلغاء.`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '❌ إلغاء', callback_data: `pda_managelist_${state.designId}` }]] } }
+    );
     return true;
   }
-  await pdfAccess.addToWhitelist(state.designId, targetId);
-  await telegram.sendMessage(chatId, `✅ المستخدم <code>${targetId}</code> بقى معاه إتاحة لتصميم "${design.label}".`, {
+  const r = await pdfAccess.addManyToWhitelist(state.designId, parsed.valid);
+  const mode = await pdfAccess.getAccessMode(state.designId);
+  const openNote = mode === 'all' ? '\n\nℹ️ التصميم ده لسه "متاح للكل" — الـ IDs اتسجلت بس مش هتفرق إلا لما تقيّده.' : '';
+  await telegram.sendMessage(
+    chatId,
+    `✅ اتضاف ${r.added.length} مستخدم جديد لتصميم "${design.label}"${r.already.length ? `، و${r.already.length} كانوا موجودين` : ''}.${formatInvalidTokens(parsed.invalid, parsed.duplicates)}${openNote}`,
+    { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '👥 للمجموعة', callback_data: `pda_managelist_${state.designId}` }]] } }
+  );
+  return true;
+}
+
+// ---------------------------------------------------------------------
+// 📦 Bulk ids / saved ID sets / multi-design activation (extends the panel
+// above). Typed input uses ONE pending-state key per admin,
+// `pdfinput_<adminId>` = { kind, designId?, setId?, name? }, consumed by
+// tryHandlePdfInput (called first thing from tryHandlePdfAddUserPaste).
+// Any pda_ button press clears pending input, so "cancel"/navigation never
+// leaves a stale state that would swallow the admin's next message.
+// The multi-design picker keeps its checkbox state in
+// `pdfapply_<adminId>` = { ids, label, setId, designIds, restrict }.
+// ---------------------------------------------------------------------
+const PDF_IDS_HINT = 'ممكن تبعت ID واحد أو أكتر مرة واحدة — كل ID في سطر، أو مفصولين بمسافة أو فاصلة.';
+
+function formatIdList(ids, max = 100) {
+  const shown = ids.slice(0, max).map((id) => `<code>${id}</code>`).join('\n');
+  const more = ids.length > max ? `\n… و ${ids.length - max} آخرين` : '';
+  return shown + more;
+}
+
+function formatInvalidTokens(invalid, duplicates) {
+  let out = '';
+  if (invalid && invalid.length > 0) {
+    const shown = invalid.slice(0, 10).map((t) => `<code>${escapeHtml(t)}</code>`).join(' ');
+    const more = invalid.length > 10 ? ` … (+${invalid.length - 10})` : '';
+    out += `\n⚠️ اتجاهلت ${invalid.length} قيمة مش USER_ID صحيح: ${shown}${more}`;
+  }
+  if (duplicates > 0) out += `\nℹ️ اتجاهلت ${duplicates} ID مكرر.`;
+  return out;
+}
+
+async function clearPdfInputStates(adminId) {
+  await Promise.all([botConfig.deleteConfig(`pdfadduser_${adminId}`), botConfig.deleteConfig(`pdfinput_${adminId}`)]);
+}
+
+// Edits the panel message into a "send me text" prompt and arms the state.
+async function promptPdfInput(chatId, messageId, adminId, state, text, cancelData) {
+  await botConfig.setConfig(`pdfinput_${adminId}`, state);
+  await telegram.editMessageText(chatId, messageId, text, {
     parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: [[{ text: '❌ إلغاء', callback_data: cancelData }]] },
   });
+}
+
+// --- bulk remove from one design -------------------------------------
+async function handlePdfRemoveManyPrompt(chatId, messageId, adminId, designId) {
+  const design = pdfDesigns.DESIGNS[designId];
+  if (!design) {
+    await telegram.editMessageText(chatId, messageId, '❌ التصميم ده مش موجود.');
+    return;
+  }
+  await promptPdfInput(
+    chatId,
+    messageId,
+    adminId,
+    { kind: 'rm_design', designId },
+    `➖ ابعت الـ USER_IDs اللي عايز تشيلها من مجموعة "${design.label}".\n\n${PDF_IDS_HINT}`,
+    `pda_managelist_${designId}`
+  );
+}
+
+// --- ID sets -----------------------------------------------------------
+async function handlePdfSetsList(chatId, messageId) {
+  const sets = await pdfAccess.getSets();
+  const rows = sets.map((s) => [{ text: `📦 ${s.name} (${s.ids.length})`, callback_data: `pda_set_${s.id}` }]);
+  const intro =
+    sets.length > 0
+      ? 'اختار مجموعة، أو اعمل مجموعة جديدة:'
+      : '📭 مفيش مجموعات لسه.\nاعمل مجموعة وحط فيها الـ IDs مرة واحدة، وبعدين فعّلها على أي تصاميم تختارها.';
+  await telegram.editMessageText(chatId, messageId, `📦 <b>مجموعات الـ IDs</b>\n\n${intro}`, {
+    parse_mode: 'HTML',
+    reply_markup: {
+      inline_keyboard: [
+        ...rows,
+        [{ text: '➕ مجموعة جديدة', callback_data: 'pda_setnew' }],
+        [{ text: '🔙 رجوع', callback_data: 'pda_back' }],
+      ],
+    },
+  });
+}
+
+async function handlePdfSetMenu(chatId, messageId, setId) {
+  const set = await pdfAccess.getSet(setId);
+  if (!set) {
+    await telegram.editMessageText(chatId, messageId, '❌ المجموعة دي مش موجودة.', {
+      reply_markup: { inline_keyboard: [[{ text: '🔙 رجوع', callback_data: 'pda_sets' }]] },
+    });
+    return;
+  }
+  const list = set.ids.length > 0 ? `\n\n${formatIdList(set.ids)}` : '\n\n📭 المجموعة فاضية.';
+  await telegram.editMessageText(chatId, messageId, `📦 <b>${escapeHtml(set.name)}</b> — ${set.ids.length} ID${list}`, {
+    parse_mode: 'HTML',
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '🚀 تفعيل على تصاميم', callback_data: `pda_setapply_${set.id}` }],
+        [
+          { text: '➕ إضافة IDs', callback_data: `pda_setadd_${set.id}` },
+          { text: '➖ حذف IDs', callback_data: `pda_setrm_${set.id}` },
+        ],
+        [{ text: '🗑 حذف المجموعة', callback_data: `pda_setdel_${set.id}` }],
+        [{ text: '🔙 رجوع', callback_data: 'pda_sets' }],
+      ],
+    },
+  });
+}
+
+async function handlePdfSetNewPrompt(chatId, messageId, adminId) {
+  await promptPdfInput(chatId, messageId, adminId, { kind: 'set_name' }, '📦 ابعت اسم المجموعة الجديدة (مثلاً: "دفعة A").', 'pda_sets');
+}
+
+async function handlePdfSetIdsPrompt(chatId, messageId, adminId, setId, kind) {
+  const set = await pdfAccess.getSet(setId);
+  if (!set) {
+    await telegram.editMessageText(chatId, messageId, '❌ المجموعة دي مش موجودة.');
+    return;
+  }
+  const verb = kind === 'set_add' ? '➕ ابعت الـ USER_IDs اللي عايز تضيفها لمجموعة' : '➖ ابعت الـ USER_IDs اللي عايز تشيلها من مجموعة';
+  await promptPdfInput(
+    chatId,
+    messageId,
+    adminId,
+    { kind, setId: set.id },
+    `${verb} "${escapeHtml(set.name)}".\n\n${PDF_IDS_HINT}`,
+    `pda_set_${set.id}`
+  );
+}
+
+async function handlePdfSetDeleteConfirm(chatId, messageId, setId) {
+  const set = await pdfAccess.getSet(setId);
+  if (!set) {
+    await handlePdfSetsList(chatId, messageId);
+    return;
+  }
+  await telegram.editMessageText(
+    chatId,
+    messageId,
+    `🗑 هتمسح المجموعة <b>${escapeHtml(set.name)}</b> (${set.ids.length} ID)؟\n\nده مش بيشيل أي حد من التصاميم اللي اتفعّلت عليها قبل كده.`,
+    {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '✅ آه، امسحها', callback_data: `pda_setdelok_${set.id}` }],
+          [{ text: '🔙 لأ', callback_data: `pda_set_${set.id}` }],
+        ],
+      },
+    }
+  );
+}
+
+async function handlePdfSetDelete(chatId, messageId, setId) {
+  await pdfAccess.deleteSet(setId);
+  await handlePdfSetsList(chatId, messageId);
+}
+
+// --- multi-design picker -----------------------------------------------
+function buildPdfApplyPicker(session) {
+  const designs = pdfDesigns.listDesigns();
+  const picked = new Set(session.designIds || []);
+  const source = session.label ? `📦 مجموعة "${escapeHtml(session.label)}"` : '⚡ IDs اتبعتت يدوي';
+  const text =
+    `🚀 <b>تفعيل على أكتر من تصميم</b>\n\n${source} — ${session.ids.length} ID\n\n` +
+    `علّم التصاميم اللي عايز تطبّق عليها، وبعدين ادوس تفعيل.\n\n` +
+    `ℹ️ لو تصميم "متاح للكل" فإضافة الـ IDs مش بتفرق إلا لو اتقيّد — علّم خيار التقييد لو عايز ده يحصل تلقائي.`;
+  const rows = designs.map((d) => [{ text: `${picked.has(d.id) ? '☑️' : '⬜'} ${d.label}`, callback_data: `pda_apt_${d.id}` }]);
+  rows.push([
+    { text: '✅ تحديد الكل', callback_data: 'pda_apall' },
+    { text: '⬜ مسح التحديد', callback_data: 'pda_apnone' },
+  ]);
+  rows.push([{ text: `${session.restrict ? '☑️' : '⬜'} قيّد التصاميم المختارة تلقائياً`, callback_data: 'pda_apmode' }]);
+  rows.push([
+    { text: '🚀 تفعيل (إضافة)', callback_data: 'pda_apgo' },
+    { text: '🗑 سحب الصلاحية', callback_data: 'pda_aprm' },
+  ]);
+  rows.push([{ text: '🔙 رجوع', callback_data: session.setId ? `pda_set_${session.setId}` : 'pda_back' }]);
+  return { text, reply_markup: { inline_keyboard: rows } };
+}
+
+async function handlePdfSetApplyStart(chatId, messageId, adminId, setId) {
+  const set = await pdfAccess.getSet(setId);
+  if (!set) {
+    await handlePdfSetsList(chatId, messageId);
+    return;
+  }
+  if (set.ids.length === 0) {
+    await telegram.editMessageText(chatId, messageId, '⚠️ المجموعة فاضية — ضيف IDs الأول.', {
+      reply_markup: { inline_keyboard: [[{ text: '🔙 رجوع', callback_data: `pda_set_${set.id}` }]] },
+    });
+    return;
+  }
+  const session = { ids: set.ids, label: set.name, setId: set.id, designIds: [], restrict: false };
+  await botConfig.setConfig(`pdfapply_${adminId}`, session);
+  const { text, reply_markup } = buildPdfApplyPicker(session);
+  await telegram.editMessageText(chatId, messageId, text, { parse_mode: 'HTML', reply_markup });
+}
+
+async function handlePdfQuickPrompt(chatId, messageId, adminId) {
+  await promptPdfInput(
+    chatId,
+    messageId,
+    adminId,
+    { kind: 'quick' },
+    `⚡ ابعت الـ USER_IDs اللي عايز تفعّلها، وبعدين هتختار التصاميم.\n\n${PDF_IDS_HINT}`,
+    'pda_back'
+  );
+}
+
+// Mutates the picker session (toggle design / all / none / restrict) and
+// re-renders the picker in place.
+async function handlePdfApplyUpdate(chatId, messageId, adminId, mutate) {
+  const key = `pdfapply_${adminId}`;
+  const session = await botConfig.getConfig(key);
+  if (!session || !Array.isArray(session.ids)) {
+    await telegram.editMessageText(chatId, messageId, '⚠️ الجلسة انتهت. ابدأ من /pdfaccess تاني.');
+    return;
+  }
+  mutate(session);
+  await botConfig.setConfig(key, session);
+  const { text, reply_markup } = buildPdfApplyPicker(session);
+  await telegram.editMessageText(chatId, messageId, text, { parse_mode: 'HTML', reply_markup });
+}
+
+async function handlePdfApplyGo(cbId, chatId, messageId, adminId, action) {
+  const key = `pdfapply_${adminId}`;
+  const session = await botConfig.getConfig(key);
+  if (!session || !Array.isArray(session.ids) || session.ids.length === 0) {
+    await telegram.answerCallbackQuery(cbId);
+    await telegram.editMessageText(chatId, messageId, '⚠️ الجلسة انتهت. ابدأ من /pdfaccess تاني.');
+    return;
+  }
+  const designIds = (session.designIds || []).filter((id) => pdfDesigns.DESIGNS[id]);
+  if (designIds.length === 0) {
+    await telegram.answerCallbackQuery(cbId, { text: '⚠️ علّم تصميم واحد على الأقل.', show_alert: true });
+    return;
+  }
+  await telegram.answerCallbackQuery(cbId, { text: '⏳ جاري التنفيذ...' });
+  const results = await pdfAccess.applyToDesigns(designIds, session.ids, action, { restrict: !!session.restrict });
+  await botConfig.deleteConfig(key);
+
+  const lines = results.map((r) => {
+    const label = pdfDesigns.DESIGNS[r.designId].label;
+    if (action === 'remove') {
+      return `• ${label}: اتشال ${r.changed}${r.unchanged ? `، ${r.unchanged} مكانوش موجودين` : ''}`;
+    }
+    const lock = r.mode === 'whitelist' ? '🔒' : '🔓';
+    return `• ${label}: +${r.changed} جديد${r.unchanged ? `، ${r.unchanged} كانوا موجودين` : ''} ${lock}`;
+  });
+  const head =
+    action === 'remove'
+      ? `🗑 <b>تم سحب الصلاحية</b> — ${session.ids.length} ID من ${results.length} تصميم`
+      : `✅ <b>تم التفعيل</b> — ${session.ids.length} ID على ${results.length} تصميم`;
+  const stillOpen = action === 'remove' ? 0 : results.filter((r) => r.mode === 'all').length;
+  const note = stillOpen > 0 ? `\n\n🔓 = التصميم لسه "متاح للكل"، فالـ IDs اتسجلت بس مش هتفرق إلا لما تقيّده.` : '';
+  const buttons = [];
+  if (session.setId) buttons.push([{ text: '📦 فتح المجموعة', callback_data: `pda_set_${session.setId}` }]);
+  buttons.push([{ text: '🔙 لوحة الصلاحيات', callback_data: 'pda_back' }]);
+  await telegram.editMessageText(chatId, messageId, `${head}\n\n${lines.join('\n')}${note}`, {
+    parse_mode: 'HTML',
+    reply_markup: { inline_keyboard: buttons },
+  });
+}
+
+// Text-input side of all the flows above. Returns true if it handled the
+// message. Bad input keeps the admin in the same step so they can retry.
+async function tryHandlePdfInput(chatId, adminId, text) {
+  const key = `pdfinput_${adminId}`;
+  const state = await botConfig.getConfig(key);
+  if (!state || !state.kind) return false;
+  await botConfig.deleteConfig(key);
+
+  const cancelRow = (data) => ({ inline_keyboard: [[{ text: '❌ إلغاء', callback_data: data }]] });
+
+  if (state.kind === 'set_name') {
+    const name = text.trim().slice(0, 40);
+    if (!name) {
+      await botConfig.setConfig(key, state);
+      await telegram.sendMessage(chatId, '⚠️ الاسم فاضي. ابعت اسم المجموعة تاني.', { reply_markup: cancelRow('pda_sets') });
+      return true;
+    }
+    await botConfig.setConfig(key, { kind: 'set_ids', name });
+    await telegram.sendMessage(chatId, `📦 المجموعة: <b>${escapeHtml(name)}</b>\n\nابعت دلوقتي الـ USER_IDs اللي فيها.\n\n${PDF_IDS_HINT}`, {
+      parse_mode: 'HTML',
+      reply_markup: cancelRow('pda_sets'),
+    });
+    return true;
+  }
+
+  const parsed = pdfAccess.parseIds(text);
+  if (parsed.valid.length === 0) {
+    await botConfig.setConfig(key, state);
+    await telegram.sendMessage(
+      chatId,
+      `⚠️ ما لقيتش أي USER_ID صحيح (لازم أرقام بس).${formatInvalidTokens(parsed.invalid, 0)}\n\nابعت تاني أو إلغاء.`,
+      { parse_mode: 'HTML', reply_markup: cancelRow('pda_back') }
+    );
+    return true;
+  }
+  const extra = formatInvalidTokens(parsed.invalid, parsed.duplicates);
+
+  if (state.kind === 'rm_design') {
+    const design = pdfDesigns.DESIGNS[state.designId];
+    if (!design) {
+      await telegram.sendMessage(chatId, '❌ التصميم ده مبقاش موجود.');
+      return true;
+    }
+    const r = await pdfAccess.removeManyFromWhitelist(state.designId, parsed.valid);
+    await telegram.sendMessage(
+      chatId,
+      `🗑 اتشال ${r.removed.length} من مجموعة "${design.label}"${r.missing.length ? `، و${r.missing.length} مكانوش فيها` : ''}.${extra}`,
+      { parse_mode: 'HTML', reply_markup: { inline_keyboard: [[{ text: '🔙 للمجموعة', callback_data: `pda_managelist_${state.designId}` }]] } }
+    );
+    return true;
+  }
+
+  if (state.kind === 'set_ids') {
+    const set = await pdfAccess.createSet(state.name, parsed.valid);
+    await telegram.sendMessage(chatId, `✅ اتعملت المجموعة <b>${escapeHtml(set.name)}</b> — ${set.ids.length} ID.${extra}`, {
+      parse_mode: 'HTML',
+      reply_markup: {
+        inline_keyboard: [
+          [{ text: '🚀 تفعيل على تصاميم', callback_data: `pda_setapply_${set.id}` }],
+          [{ text: '📦 فتح المجموعة', callback_data: `pda_set_${set.id}` }],
+        ],
+      },
+    });
+    return true;
+  }
+
+  if (state.kind === 'set_add' || state.kind === 'set_rm') {
+    const r =
+      state.kind === 'set_add'
+        ? await pdfAccess.addToSet(state.setId, parsed.valid)
+        : await pdfAccess.removeFromSet(state.setId, parsed.valid);
+    if (!r) {
+      await telegram.sendMessage(chatId, '❌ المجموعة دي مبقتش موجودة.');
+      return true;
+    }
+    const msg =
+      state.kind === 'set_add'
+        ? `✅ اتضاف ${r.added.length} جديد لمجموعة <b>${escapeHtml(r.set.name)}</b>${r.already.length ? `، و${r.already.length} كانوا موجودين` : ''}.`
+        : `🗑 اتشال ${r.removed.length} من مجموعة <b>${escapeHtml(r.set.name)}</b>${r.missing.length ? `، و${r.missing.length} مكانوش فيها` : ''}.`;
+    await telegram.sendMessage(chatId, `${msg} (الإجمالي: ${r.set.ids.length})${extra}`, {
+      parse_mode: 'HTML',
+      reply_markup: { inline_keyboard: [[{ text: '📦 فتح المجموعة', callback_data: `pda_set_${r.set.id}` }]] },
+    });
+    return true;
+  }
+
+  if (state.kind === 'quick') {
+    const session = { ids: parsed.valid, label: null, setId: null, designIds: [], restrict: false };
+    await botConfig.setConfig(`pdfapply_${adminId}`, session);
+    const picker = buildPdfApplyPicker(session);
+    await telegram.sendMessage(chatId, `${picker.text}${extra}`, { parse_mode: 'HTML', reply_markup: picker.reply_markup });
+    return true;
+  }
+
   return true;
 }
 
@@ -3772,6 +4156,9 @@ if (data.startsWith('ansclr_')) {
       return;
     }
 
+    // Any panel button cancels a pending "type some ids" step.
+    await clearPdfInputStates(userId);
+
     if (data === 'pda_back') {
       await telegram.answerCallbackQuery(cb.id);
       await handlePdfAccessBackButton(chatId, messageId);
@@ -3808,6 +4195,95 @@ if (data.startsWith('ansclr_')) {
       const designId = data.replace('pda_adduser_', '');
       await telegram.answerCallbackQuery(cb.id);
       await handlePdfAddUserPrompt(chatId, messageId, userId, designId);
+      return;
+    }
+    if (data.startsWith('pda_rmmany_')) {
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfRemoveManyPrompt(chatId, messageId, userId, data.replace('pda_rmmany_', ''));
+      return;
+    }
+
+    // 📦 ID sets
+    if (data === 'pda_sets') {
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfSetsList(chatId, messageId);
+      return;
+    }
+    if (data === 'pda_setnew') {
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfSetNewPrompt(chatId, messageId, userId);
+      return;
+    }
+    if (data.startsWith('pda_set_')) {
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfSetMenu(chatId, messageId, data.replace('pda_set_', ''));
+      return;
+    }
+    if (data.startsWith('pda_setadd_')) {
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfSetIdsPrompt(chatId, messageId, userId, data.replace('pda_setadd_', ''), 'set_add');
+      return;
+    }
+    if (data.startsWith('pda_setrm_')) {
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfSetIdsPrompt(chatId, messageId, userId, data.replace('pda_setrm_', ''), 'set_rm');
+      return;
+    }
+    if (data.startsWith('pda_setdel_')) {
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfSetDeleteConfirm(chatId, messageId, data.replace('pda_setdel_', ''));
+      return;
+    }
+    if (data.startsWith('pda_setdelok_')) {
+      await telegram.answerCallbackQuery(cb.id, { text: '✅ تم الحذف.' });
+      await handlePdfSetDelete(chatId, messageId, data.replace('pda_setdelok_', ''));
+      return;
+    }
+
+    // 🚀 multi-design activation
+    if (data.startsWith('pda_setapply_')) {
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfSetApplyStart(chatId, messageId, userId, data.replace('pda_setapply_', ''));
+      return;
+    }
+    if (data === 'pda_quick') {
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfQuickPrompt(chatId, messageId, userId);
+      return;
+    }
+    if (data.startsWith('pda_apt_')) {
+      const designId = data.replace('pda_apt_', '');
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfApplyUpdate(chatId, messageId, userId, (s) => {
+        const i = s.designIds.indexOf(designId);
+        if (i >= 0) s.designIds.splice(i, 1);
+        else if (pdfDesigns.DESIGNS[designId]) s.designIds.push(designId);
+      });
+      return;
+    }
+    if (data === 'pda_apall') {
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfApplyUpdate(chatId, messageId, userId, (s) => {
+        s.designIds = pdfDesigns.listDesigns().map((d) => d.id);
+      });
+      return;
+    }
+    if (data === 'pda_apnone') {
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfApplyUpdate(chatId, messageId, userId, (s) => {
+        s.designIds = [];
+      });
+      return;
+    }
+    if (data === 'pda_apmode') {
+      await telegram.answerCallbackQuery(cb.id);
+      await handlePdfApplyUpdate(chatId, messageId, userId, (s) => {
+        s.restrict = !s.restrict;
+      });
+      return;
+    }
+    if (data === 'pda_apgo' || data === 'pda_aprm') {
+      await handlePdfApplyGo(cb.id, chatId, messageId, userId, data === 'pda_apgo' ? 'add' : 'remove');
       return;
     }
 
